@@ -685,6 +685,11 @@ namespace npctouch::reactions
         runtime::logInfo(message);
     }
 
+    bool moveActor(RE::Actor* npc, const float x, const float y, const float z) noexcept
+    {
+        return npc && callActor(npc, "SetPosition", x, y, z);
+    }
+
     void update() noexcept
     {
         if (g_states.empty()) {

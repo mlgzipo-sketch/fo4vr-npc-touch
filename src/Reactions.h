@@ -15,6 +15,9 @@ namespace npctouch::reactions
     // the hand's velocity in game units per second.
     void onTouch(RE::Actor* npc, const char* bone, const float (&handVelocity)[3]) noexcept;
 
+    // Moves the NPC to a new spot (Papyrus SetPosition), for dragging.
+    bool moveActor(RE::Actor* npc, float x, float y, float z) noexcept;
+
     // Called every frame: ends head tracking and lets annoyance fade.
     void update() noexcept;
 }

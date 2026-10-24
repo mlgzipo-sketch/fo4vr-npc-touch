@@ -8,6 +8,7 @@
 #include <ROCK/Collision.h>
 #include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
+#include <ROCK/Input.h>
 #include "NpcCollision.h"
 #include "NpcProxyBodies.h"
 #include "Reactions.h"
@@ -29,6 +30,7 @@ namespace
     namespace collision = rock::api::collision;
     namespace diagnostics = rock::api::diagnostics;
     namespace hands = rock::api::hands;
+    namespace input = rock::api::input;
 
     constexpr auto kOverlayDuration = std::chrono::seconds(3);
     constexpr auto kSummaryInterval = std::chrono::seconds(10);
@@ -36,6 +38,7 @@ namespace
     const collision::ApiV1* g_collision{};
     const diagnostics::ApiV1* g_diagnostics{};
     const hands::ApiV1* g_hands{};
+    const input::ApiV1* g_input{};
 
     std::uint64_t g_lastEventSequence{ 0 };
     std::uint64_t g_npcTouchCount{ 0 };
@@ -335,7 +338,26 @@ namespace
             float velocity[3]{};
             std::uint32_t touchedFormId{ 0 };
             const char* touchedBone{ nullptr };
+            // Grabbing: grip held while touching an NPC drags them along.
+            bool gripWasHeld{ false };
+            std::uint32_t grabbedFormId{ 0 };
+            const char* grabbedBone{ nullptr };
+            RE::NiPoint3 grabOffset{};  // hand minus bone at the moment of the grab
+            Clock::time_point lastMove{};
+            std::uint32_t gripStatusLogged{ 0 };
         };
+
+        // OpenVR button id of the grip.
+        constexpr std::uint32_t kGripButton = 2;
+        // The hand may be this far from the body (beyond a touch) to grab.
+        constexpr float kGrabReach = 10.0f;
+        // Hand movement the NPC ignores before following, and the pull at which
+        // the grip slips.
+        constexpr float kGrabSlack = 3.0f;
+        constexpr float kGrabBreak = 45.0f;
+        // Fastest drag, game units per second (walking is about 100).
+        constexpr float kGrabMaxSpeed = 160.0f;
+        constexpr auto kGrabMoveInterval = std::chrono::milliseconds(33);
 
         std::array<HandState, 2> g_handStates{};
 
@@ -485,6 +507,106 @@ namespace
             return best;
         }
 
+        bool gripHeld(const std::uint64_t ownerToken, const rock::api::Hand hand, HandState& state) noexcept
+        {
+            if (!g_input) {
+                return false;
+            }
+            input::RawWandButtonStateV1 button{};
+            const auto status = g_input->getRawWandButtonStateV1(ownerToken, hand, kGripButton, &button);
+            if (state.gripStatusLogged < 2 && (status != rock::api::Status::Ok || button.held)) {
+                ++state.gripStatusLogged;
+                char message[160]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "Grip %s hand: status=%u available=%u held=%u reason=%u",
+                    handName(hand),
+                    static_cast<std::uint32_t>(status),
+                    button.available,
+                    button.held,
+                    static_cast<std::uint32_t>(button.availabilityReason));
+                npctouch::runtime::logInfo(message);
+            }
+            return status == rock::api::Status::Ok && button.available && button.held;
+        }
+
+        void endGrab(const rock::api::Hand hand, HandState& state, const char* reason) noexcept
+        {
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "GRAB END: %s hand let go of %08X (%s)", handName(hand), state.grabbedFormId, reason);
+            npctouch::runtime::logInfo(message);
+            state.grabbedFormId = 0;
+            state.grabbedBone = nullptr;
+        }
+
+        void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
+        {
+            const bool pressed = grip && !state.gripWasHeld;
+            state.gripWasHeld = grip;
+            const auto now = Clock::now();
+
+            if (state.grabbedFormId != 0) {
+                auto* actor = RE::TESForm::GetFormByID<RE::Actor>(state.grabbedFormId);
+                auto* root = actor ? actor->Get3D() : nullptr;
+                auto* bone = root ? findNode(root, state.grabbedBone) : nullptr;
+                if (!grip) {
+                    endGrab(hand, state, "released");
+                    return;
+                }
+                if (!bone || actor->IsDead(false)) {
+                    endGrab(hand, state, "NPC gone");
+                    return;
+                }
+                // Where the grabbed bone should be to stay in the hand, on the ground plane.
+                RE::NiPoint3 shift = state.position - state.grabOffset - bone->world.translate;
+                shift.z = 0.0f;
+                const float pull = std::sqrt(shift.x * shift.x + shift.y * shift.y);
+                if (pull > kGrabBreak) {
+                    endGrab(hand, state, "slipped");
+                    return;
+                }
+                const float seconds = std::chrono::duration<float>(now - state.lastMove).count();
+                if (pull > kGrabSlack && now - state.lastMove >= kGrabMoveInterval) {
+                    const float step = std::min(pull - kGrabSlack, kGrabMaxSpeed * std::min(seconds, 0.1f));
+                    const auto feet = actor->GetPosition();
+                    (void)npctouch::reactions::moveActor(actor, feet.x + shift.x / pull * step, feet.y + shift.y / pull * step, feet.z);
+                    state.lastMove = now;
+                }
+                return;
+            }
+
+            if (!pressed || !hit.actor || hit.gap > kGrabReach || hit.actor->IsDead(false) ||
+                hit.actor->DoGetSitSleepState() != RE::SIT_SLEEP_STATE::kNormal) {
+                return;
+            }
+            auto* root = hit.actor->Get3D();
+            auto* bone = root ? findNode(root, hit.bone) : nullptr;
+            if (!bone) {
+                return;
+            }
+            state.grabbedFormId = hit.actor->GetFormID();
+            state.grabbedBone = hit.bone;
+            state.grabOffset = state.position - bone->world.translate;
+            state.lastMove = now;
+            char message[200]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "GRAB BEGIN: %s hand grabbed '%s' form=%08X bone=%s gap=%.0f",
+                handName(hand),
+                actorName(hit.actor),
+                state.grabbedFormId,
+                hit.bone,
+                hit.gap);
+            npctouch::runtime::logInfo(message);
+            char overlay[128]{};
+            std::snprintf(overlay, sizeof(overlay), "NpcTouch: grabbed %s (%s)", actorName(hit.actor), hit.bone);
+            showOverlay(overlay);
+            const float still[3]{};
+            npctouch::reactions::onTouch(hit.actor, hit.bone, still);
+        }
+
         void update(const std::uint64_t ownerToken) noexcept
         {
             auto* player = RE::PlayerCharacter::GetSingleton();
@@ -505,6 +627,7 @@ namespace
                     std::snprintf(diag.minBone, sizeof(diag.minBone), "%s", hit.bone);
                     std::snprintf(diag.minName, sizeof(diag.minName), "%s", actorName(hit.actor));
                 }
+                updateGrab(handIds[index], state, hit, gripHeld(ownerToken, handIds[index], state));
                 const bool inside = hit.actor && hit.gap <= kHandReach;
                 const bool released = !hit.actor || hit.gap > kHandReach + kReleaseMargin ||
                                       (state.touchedFormId != 0 && hit.actor->GetFormID() != state.touchedFormId);
@@ -653,6 +776,13 @@ namespace
         if (client.acquire(static_cast<std::uint32_t>(hands::PermissionV1::Read), g_hands) != rock::api::Status::Ok) {
             g_hands = nullptr;
             npctouch::runtime::logWarning("ROCK hands interface unavailable; proximity touch detection disabled");
+        }
+        // Input gives the grip button for grabbing NPCs.
+        if (client.acquire(static_cast<std::uint32_t>(input::PermissionV1::Read), g_input) != rock::api::Status::Ok) {
+            g_input = nullptr;
+            npctouch::runtime::logWarning("ROCK input interface unavailable; grabbing NPCs disabled");
+        } else {
+            npctouch::runtime::logInfo("ROCK input interface ready; grip + touch grabs NPCs");
         }
         return true;
     }
