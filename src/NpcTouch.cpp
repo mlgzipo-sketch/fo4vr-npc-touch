@@ -329,6 +329,8 @@ namespace
             RE::NiPoint3 previous{};
             Clock::time_point previousTime{};
             float speed{ 0.0f };
+            // Smoothed hand velocity in game units per second.
+            float velocity[3]{};
             std::uint32_t touchedFormId{ 0 };
             const char* touchedBone{ nullptr };
         };
@@ -368,6 +370,12 @@ namespace
                 const float seconds = std::chrono::duration<float>(now - state.previousTime).count();
                 if (seconds > 0.0f) {
                     state.speed = distance(position, state.position) / seconds;
+                    // Frame-to-frame motion is noisy at 90 fps; blend it over a few frames.
+                    constexpr float kBlend = 0.4f;
+                    const float delta[3]{ position.x - state.position.x, position.y - state.position.y, position.z - state.position.z };
+                    for (int axis = 0; axis < 3; ++axis) {
+                        state.velocity[axis] += (delta[axis] / seconds - state.velocity[axis]) * kBlend;
+                    }
                 }
             }
             state.previous = state.position;
@@ -507,17 +515,18 @@ namespace
                     std::snprintf(
                         message,
                         sizeof(message),
-                        "PROXIMITY TOUCH BEGIN: %s hand -> NPC '%s' form=%08X bone=%s handSpeed=%.0f u/s",
+                        "PROXIMITY TOUCH BEGIN: %s hand -> NPC '%s' form=%08X bone=%s handSpeed=%.0f u/s smoothed=%.0f",
                         handName(handIds[index]),
                         actorName(hit.actor),
                         state.touchedFormId,
                         hit.bone,
-                        state.speed);
+                        state.speed,
+                        std::sqrt(state.velocity[0] * state.velocity[0] + state.velocity[1] * state.velocity[1] + state.velocity[2] * state.velocity[2]));
                     npctouch::runtime::logInfo(message);
                     char overlay[128]{};
                     std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> %s (%s)", handName(handIds[index]), actorName(hit.actor), hit.bone);
                     showOverlay(overlay);
-                    npctouch::reactions::onTouch(hit.actor, hit.bone);
+                    npctouch::reactions::onTouch(hit.actor, hit.bone, state.velocity);
                 } else if (state.touchedFormId != 0 && released) {
                     char message[160]{};
                     std::snprintf(

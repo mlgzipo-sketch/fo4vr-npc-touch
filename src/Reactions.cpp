@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,13 @@ namespace npctouch::reactions
             // Companion affinity from which chest/pelvis touches count as welcome
             // (1000 is the game's "Idolizes" level). Romanced companions always do.
             float closeAffinity{ 1000.0f };
+            // A hand moving at least this fast (game units/s) shoves the NPC.
+            bool shoves{ true };
+            float shoveSpeed{ 200.0f };
+            // Faster still knocks the NPC over (ragdoll), if allowed.
+            bool knockdowns{ true };
+            float knockdownSpeed{ 400.0f };
+            float knockdownForce{ 4.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
@@ -80,6 +88,12 @@ namespace npctouch::reactions
             Companion{ 0x00019FD9, 0, 0x0007925D },           // Preston Garvey
             Companion{ 0x000BBEE6, 0x0012B8A7, 0x0011CE29 },  // X6-88
         };
+
+        // Human stagger idles (CharacterMT*): small and medium, forward and back.
+        constexpr std::uint32_t kStaggerForwardSmall = 0x00059A94;
+        constexpr std::uint32_t kStaggerForwardMedium = 0x00059A93;
+        constexpr std::uint32_t kStaggerBackSmall = 0x00059A97;
+        constexpr std::uint32_t kStaggerBackMedium = 0x00059A96;
 
         constexpr std::uint32_t kAffinityValue = 0x000A1B80;  // CA_Affinity
         constexpr std::uint32_t kRomanticValue = 0x00148DF6;  // CA_IsRomantic
@@ -177,6 +191,16 @@ namespace npctouch::reactions
                         g_settings.warningTopics = parseTopics(value);
                     } else if (key == "fCloseAffinity") {
                         g_settings.closeAffinity = number;
+                    } else if (key == "bEnableShoves") {
+                        g_settings.shoves = flag;
+                    } else if (key == "fShoveSpeed") {
+                        g_settings.shoveSpeed = number;
+                    } else if (key == "bEnableKnockdowns") {
+                        g_settings.knockdowns = flag;
+                    } else if (key == "fKnockdownSpeed") {
+                        g_settings.knockdownSpeed = number;
+                    } else if (key == "fKnockdownForce") {
+                        g_settings.knockdownForce = number;
                     }
                 }
             } catch (...) {
@@ -333,18 +357,18 @@ namespace npctouch::reactions
             return dispatched;
         }
 
-        // Topics have no script attached, so packing one makes the library
-        // create and bind a new script object through ObjectBindPolicy, which
-        // faulted in VR. Bind it through the VM's virtual bind interface
+        // Topics and idles have no script attached, so packing one makes the
+        // library create and bind a new script object through ObjectBindPolicy,
+        // which faulted in VR. Bind it through the VM's virtual bind interface
         // instead, the same path the game uses.
-        RE::BSTSmartPointer<RE::BSScript::Object> topicObject(RE::TESTopic* topic) noexcept
+        RE::BSTSmartPointer<RE::BSScript::Object> formObject(RE::TESForm* form) noexcept
         {
             RE::BSTSmartPointer<RE::BSScript::Object> object;
             auto* vm = virtualMachine();
-            if (!vm || !topic || g_brokenFunctions.contains("TopicObject")) {
+            if (!vm || !form || g_brokenFunctions.contains("TopicObject")) {
                 return object;
             }
-            constexpr auto type = static_cast<std::uint32_t>(RE::TESTopic::FORM_ID);
+            const auto type = static_cast<std::uint32_t>(form->GetFormType());
             RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> typeInfo;
             bool ok{ false };
             auto findType = [&]() { ok = vm->GetScriptObjectType(type, typeInfo) && typeInfo; };
@@ -354,7 +378,7 @@ namespace npctouch::reactions
             std::size_t handle{ 0 };
             auto findHandle = [&]() {
                 const auto& policy = vm->GetObjectHandlePolicy();
-                handle = policy.GetHandleForObject(type, topic);
+                handle = policy.GetHandleForObject(type, form);
                 ok = handle != policy.EmptyHandle();
             };
             if (!guarded("TopicObject", "handle", findHandle) || !ok) {
@@ -387,7 +411,7 @@ namespace npctouch::reactions
                 }
             }
             if (!ok) {
-                runtime::logWarning("Papyrus could not create a script object for the topic");
+                runtime::logWarning("Papyrus could not create a script object for a form");
                 g_brokenFunctions.insert("TopicObject");
                 return nullptr;
             }
@@ -396,7 +420,7 @@ namespace npctouch::reactions
                 return nullptr;
             }
             char message[160]{};
-            std::snprintf(message, sizeof(message), "Topic %08X bound to a new script object (handle %llX)", topic->GetFormID(), static_cast<unsigned long long>(handle));
+            std::snprintf(message, sizeof(message), "Form %08X bound to a new script object (handle %llX)", form->GetFormID(), static_cast<unsigned long long>(handle));
             runtime::logInfo(message);
             return object;
         }
@@ -407,7 +431,7 @@ namespace npctouch::reactions
             if (!topic) {
                 return false;
             }
-            auto object = topicObject(topic);
+            auto object = formObject(topic);
             if (!object) {
                 return false;
             }
@@ -418,6 +442,19 @@ namespace npctouch::reactions
                 static_cast<RE::Actor*>(nullptr),
                 false,
                 static_cast<RE::TESObjectREFR*>(RE::PlayerCharacter::GetSingleton()));
+        }
+
+        bool playIdle(RE::Actor* actor, const std::uint32_t idleId) noexcept
+        {
+            auto* idle = RE::TESForm::GetFormByID(idleId);
+            if (!idle || idle->GetFormType() != RE::ENUM_FORM_ID::kIDLE) {
+                return false;
+            }
+            auto object = formObject(idle);
+            if (!object) {
+                return false;
+            }
+            return callActor(actor, "PlayIdle", object);
         }
 
         // -------------------------------------------------------------- logic
@@ -536,7 +573,7 @@ namespace npctouch::reactions
         }
     }
 
-    void onTouch(RE::Actor* npc, const char* bone) noexcept
+    void onTouch(RE::Actor* npc, const char* bone, const float (&handVelocity)[3]) noexcept
     {
         if (!g_settings.enabled || !npc) {
             return;
@@ -551,6 +588,32 @@ namespace npctouch::reactions
         const bool friendly = companion || teammate;
 
         lookAtPlayer(npc, state, now);
+
+        // A fast hand shoves the NPC: a stagger in the direction of the push,
+        // or a knockdown for a hard hit. Companions are never knocked over.
+        const char* push = "none";
+        const float speed = std::sqrt(handVelocity[0] * handVelocity[0] + handVelocity[1] * handVelocity[1] + handVelocity[2] * handVelocity[2]);
+        if (g_settings.shoves && !state.fighting && speed >= g_settings.shoveSpeed) {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (g_settings.knockdowns && !friendly && speed >= g_settings.knockdownSpeed && player &&
+                callActor(static_cast<RE::Actor*>(player), "PushActorAway", npc, g_settings.knockdownForce)) {
+                push = "knockdown";
+                state.annoyance += 4.0f;
+            } else {
+                // The NPC's facing on the ground plane; a push along it sends them forward.
+                const float heading = npc->data.angle.z;
+                const float along = handVelocity[0] * std::sin(heading) + handVelocity[1] * std::cos(heading);
+                const bool medium = speed >= (g_settings.shoveSpeed + g_settings.knockdownSpeed) * 0.5f;
+                const auto idle = along > 0.0f ? (medium ? kStaggerForwardMedium : kStaggerForwardSmall) :
+                                                 (medium ? kStaggerBackMedium : kStaggerBackSmall);
+                if (playIdle(npc, idle)) {
+                    push = medium ? "stagger medium" : "stagger small";
+                    if (!friendly) {
+                        state.annoyance += 2.0f;
+                    }
+                }
+            }
+        }
 
         const bool canSpeak = now - state.lastSpeech >=
                               std::chrono::milliseconds(static_cast<int>(g_settings.speechCooldownSeconds * 1000.0f));
@@ -608,10 +671,12 @@ namespace npctouch::reactions
         std::snprintf(
             message,
             sizeof(message),
-            "REACTION: '%s' %s zone=%s annoyance=%.1f affinity=%.0f romantic=%d -> %s topic=%08X",
+            "REACTION: '%s' %s zone=%s speed=%.0f push=%s annoyance=%.1f affinity=%.0f romantic=%d -> %s topic=%08X",
             actorName(npc),
             friendly ? "companion" : "npc",
             zoneName(zone),
+            speed,
+            push,
             state.annoyance,
             affinity,
             romantic,
