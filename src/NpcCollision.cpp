@@ -1,23 +1,27 @@
 // Lets ROCK's physical hands stop against standing NPCs.
 //
-// ROCK's "npcDynamicCollisions" setting only pairs its dynamic hand and weapon
-// layers with BIPED_NO_CC (33), the layer NPC body parts use while sitting.
-// Standing NPCs keep their body parts on BIPED (8), so hands pass through.
-// This adds the same pairing for BIPED in the game's collision filter matrix.
-// Layer numbers and offsets come from ROCK's CollisionLayerPolicy.h and
-// HavokOffsets.h for Fallout 4 VR 1.2.72.
+// ROCK's "npcDynamicCollisions" setting pairs its dynamic hands with
+// BIPED_NO_CC (33), the layer NPC body parts switch to while sitting. Standing
+// NPCs keep their body parts on BIPED (8), so hands pass through them. ROCK
+// re-applies its layer matrix every frame, so instead of changing the matrix
+// this moves the body parts of NPCs near the player from 8 to 33, and back
+// once they are far away. Offsets come from ROCK 0.9 (HavokOffsets.h) for
+// Fallout 4 VR 1.2.72.
 
 #include "NpcCollision.h"
 #include "Runtime.h"
 
 #include <RE/Fallout.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace npctouch::collision
 {
@@ -25,71 +29,91 @@ namespace npctouch::collision
     {
         constexpr std::uint32_t kLayerBiped = 8;
         constexpr std::uint32_t kLayerBipedNoCc = 33;
-        // ROCK dynamic right hand, weapon and left hand proxies.
-        constexpr std::uint32_t kRockDynamicLayers[]{ 48, 51, 52 };
         constexpr std::uint32_t kLayerMask = 0x7F;
 
-        constexpr std::uintptr_t kCollisionFilterSingleton = 0x59429B8;
-        constexpr std::uintptr_t kFilterCollisionMatrix = 0x1A0;
         constexpr std::uintptr_t kCollisionObjectGetFilterInfo = 0x1E08D60;
+        constexpr std::uintptr_t kSetBodyCollisionFilterInfo = 0x1DF5B80;
+        constexpr std::uintptr_t kCollisionObjectPhysicsSystem = 0x20;
+        constexpr std::uintptr_t kCollisionObjectBodyIndex = 0x28;
+        constexpr std::uintptr_t kPhysicsSystemInstance = 0x18;
+        constexpr std::uintptr_t kInstanceWorld = 0x18;
+        constexpr std::uintptr_t kInstanceBodyIds = 0x20;
+        constexpr std::uintptr_t kInstanceBodyCount = 0x28;
+        constexpr std::uintptr_t kWorldBodyArray = 0x20;
+        constexpr std::uintptr_t kBodyStride = 0x90;
+        constexpr std::uintptr_t kBodyFilterInfo = 0x44;
+        constexpr std::uintptr_t kBodyId = 0x60;
+        constexpr std::uint32_t kInvalidBodyId = 0x7FFF'FFFF;
 
         bool g_enabled{ true };
+        float g_radius{ 200.0f };
         bool g_faulted{ false };
-        bool g_loggedRows{ false };
-        std::uint32_t g_applyCount{ 0 };
         std::uint32_t g_frame{ 0 };
+        std::uint32_t g_loggedSwitches{ 0 };
         std::unordered_set<std::uint32_t> g_describedActors;
+        // NPCs whose body parts we moved to layer 33.
+        std::unordered_set<std::uint32_t> g_switched;
 
-        constexpr std::uint64_t bit(const std::uint32_t layer) noexcept
+        struct BodyRef
         {
-            return std::uint64_t{ 1 } << layer;
-        }
+            void* world{ nullptr };
+            std::uint32_t id{ kInvalidBodyId };
+        };
 
         // Raw game memory is read under SEH so a wrong offset only turns this
-        // feature off.
-        std::uint64_t* readMatrix() noexcept
+        // feature off instead of crashing the game.
+        bool resolveBody(void* collisionObject, BodyRef& out) noexcept
         {
             __try {
-                const auto base = REL::Module::get().base();
-                auto* filter = *reinterpret_cast<void**>(base + kCollisionFilterSingleton);
-                if (!filter) {
-                    return nullptr;
+                auto* system = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(collisionObject) + kCollisionObjectPhysicsSystem);
+                if (!system) {
+                    return false;
                 }
-                return reinterpret_cast<std::uint64_t*>(reinterpret_cast<std::uintptr_t>(filter) + kFilterCollisionMatrix);
+                auto* instance = *reinterpret_cast<std::uint8_t**>(system + kPhysicsSystemInstance);
+                if (!instance) {
+                    return false;
+                }
+                auto* world = *reinterpret_cast<std::uint8_t**>(instance + kInstanceWorld);
+                auto* ids = *reinterpret_cast<std::uint32_t**>(instance + kInstanceBodyIds);
+                const auto count = *reinterpret_cast<std::int32_t*>(instance + kInstanceBodyCount);
+                const auto index = *reinterpret_cast<std::int32_t*>(static_cast<std::uint8_t*>(collisionObject) + kCollisionObjectBodyIndex);
+                if (!world || !ids || index < 0 || index >= count) {
+                    return false;
+                }
+                const auto id = ids[index];
+                if (id == kInvalidBodyId) {
+                    return false;
+                }
+                auto* bodies = *reinterpret_cast<std::uint8_t**>(world + kWorldBodyArray);
+                if (!bodies || *reinterpret_cast<std::uint32_t*>(bodies + id * kBodyStride + kBodyId) != id) {
+                    return false;
+                }
+                out.world = world;
+                out.id = id;
+                return true;
             } __except (1) {
-                return nullptr;
+                return false;
             }
         }
 
-        // Returns how many layer pairs had to be added, or -1 on a fault.
-        int applyPairs(std::uint64_t* matrix) noexcept
+        bool readFilter(const BodyRef& body, std::uint32_t& info) noexcept
         {
             __try {
-                int added = 0;
-                for (const auto layer : kRockDynamicLayers) {
-                    // Follow ROCK's own choice: only rows it pairs with sitting NPCs.
-                    if ((matrix[layer] & bit(kLayerBipedNoCc)) == 0) {
-                        continue;
-                    }
-                    if ((matrix[layer] & bit(kLayerBiped)) == 0) {
-                        matrix[layer] |= bit(kLayerBiped);
-                        ++added;
-                    }
-                    if ((matrix[kLayerBiped] & bit(layer)) == 0) {
-                        matrix[kLayerBiped] |= bit(layer);
-                        ++added;
-                    }
-                }
-                return added;
+                auto* bodies = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(body.world) + kWorldBodyArray);
+                info = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + kBodyFilterInfo);
+                return true;
             } __except (1) {
-                return -1;
+                return false;
             }
         }
 
-        bool copyRow(const std::uint64_t* matrix, const std::uint32_t layer, std::uint64_t& out) noexcept
+        using SetFilterInfo = void (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
+
+        bool writeFilter(const BodyRef& body, const std::uint32_t info) noexcept
         {
             __try {
-                out = matrix[layer];
+                const auto function = reinterpret_cast<SetFilterInfo>(REL::Module::get().base() + kSetBodyCollisionFilterInfo);
+                function(body.world, body.id, info, 0);
                 return true;
             } __except (1) {
                 return false;
@@ -110,42 +134,63 @@ namespace npctouch::collision
             }
         }
 
-        void logRows(const std::uint64_t* matrix, const char* when) noexcept
-        {
-            char message[512]{};
-            int length = std::snprintf(message, sizeof(message), "Collision matrix %s:", when);
-            for (const auto layer : { kLayerBiped, kLayerBipedNoCc, 43u, 48u, 51u, 52u }) {
-                std::uint64_t row{ 0 };
-                if (!copyRow(matrix, layer, row)) {
-                    runtime::logWarning("Collision matrix could not be read; NPC hand collision is off");
-                    g_faulted = true;
-                    return;
-                }
-                length += std::snprintf(message + length, sizeof(message) - length, " [%u]=%016llX", layer, static_cast<unsigned long long>(row));
-            }
-            runtime::logInfo(message);
-        }
-
-        void countLayers(RE::NiAVObject* object, std::uint32_t (&layers)[128], std::uint32_t& bodies, std::uint32_t& unread, const int depth) noexcept
+        template <class F>
+        void forEachCollisionObject(RE::NiAVObject* object, F& visit, const int depth = 0)
         {
             if (!object || depth > 64) {
                 return;
             }
             if (auto* collision = object->collisionObject.get()) {
-                ++bodies;
-                std::uint32_t info{ 0 };
-                if (filterInfoOf(collision, info) && info != 0xFFFF'FFFF) {
-                    ++layers[info & kLayerMask];
-                } else {
-                    ++unread;
-                }
+                visit(collision);
             }
             if (auto* node = object->IsNode()) {
                 auto& children = node->GetRuntimeData().children;
                 for (std::uint16_t index = 0; index < children.size(); ++index) {
-                    countLayers(children[index].get(), layers, bodies, unread, depth + 1);
+                    forEachCollisionObject(children[index].get(), visit, depth + 1);
                 }
             }
+        }
+
+        // Moves every body part on layer `from` to layer `to`; returns how many moved.
+        int moveParts(RE::Actor* actor, const std::uint32_t from, const std::uint32_t to) noexcept
+        {
+            auto* root = actor ? actor->Get3D() : nullptr;
+            if (!root) {
+                return 0;
+            }
+            int moved = 0;
+            auto visit = [&](RE::NiCollisionObject* collision) {
+                if (g_faulted) {
+                    return;
+                }
+                BodyRef body{};
+                std::uint32_t info{ 0 };
+                if (!resolveBody(collision, body) || !readFilter(body, info) || (info & kLayerMask) != from) {
+                    return;
+                }
+                if (!writeFilter(body, (info & ~kLayerMask) | to)) {
+                    runtime::logWarning("Collision: changing an NPC body layer faulted; NPC hand collision is off");
+                    g_faulted = true;
+                    return;
+                }
+                ++moved;
+            };
+            forEachCollisionObject(root, visit);
+            return moved;
+        }
+
+        float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+        {
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float dz = a.z - b.z;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        const char* nameOf(RE::Actor* actor) noexcept
+        {
+            const char* name = actor ? actor->GetDisplayFullName() : nullptr;
+            return name && name[0] ? name : "<no name>";
         }
     }
 
@@ -163,49 +208,79 @@ namespace npctouch::collision
                 while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
                     key.pop_back();
                 }
+                const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 if (key == "bHandsCollideWithNPCs") {
-                    g_enabled = std::strtof(line.c_str() + equals + 1, nullptr) != 0.0f;
+                    g_enabled = value != 0.0f;
+                } else if (key == "fCollisionRadius" && value > 0.0f) {
+                    g_radius = value;
                 }
             }
         } catch (...) {
         }
-        runtime::logInfo(g_enabled ? "NPC hand collision: on" : "NPC hand collision: off (bHandsCollideWithNPCs=0)");
+        char message[128]{};
+        std::snprintf(message, sizeof(message), "NPC hand collision: %s, radius %.0f", g_enabled ? "on" : "off", g_radius);
+        runtime::logInfo(message);
     }
 
     void update(const bool worldAvailable) noexcept
     {
-        if (!g_enabled || g_faulted || !worldAvailable) {
+        if (!g_enabled || g_faulted) {
             return;
         }
-        // ROCK rewrites its rows when the world changes; check about once a second.
-        if (g_frame++ % 90 != 0) {
+        if (!worldAvailable) {
+            g_switched.clear();
             return;
         }
-        auto* matrix = readMatrix();
-        if (!matrix) {
+        // The game moves parts back to 8 when an NPC stands up, so check often.
+        if (g_frame++ % 10 != 0) {
             return;
         }
-        if (!g_loggedRows) {
-            logRows(matrix, "before");
-        }
-        const int added = applyPairs(matrix);
-        if (added < 0) {
-            runtime::logWarning("Collision matrix write faulted; NPC hand collision is off");
-            g_faulted = true;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* lists = RE::ProcessLists::GetSingleton();
+        if (!player || !lists) {
             return;
         }
-        if (added > 0) {
-            ++g_applyCount;
-            char message[160]{};
-            std::snprintf(message, sizeof(message), "Collision: paired ROCK hands with standing NPCs (%d bits, time %u)", added, g_applyCount);
-            runtime::logInfo(message);
-            if (!g_loggedRows || g_applyCount <= 3) {
-                logRows(matrix, "after");
+        std::unordered_set<std::uint32_t> stillNear;
+        for (const auto& handle : lists->highActorHandles) {
+            auto actorPtr = handle.get();
+            auto* actor = actorPtr.get();
+            if (!actor || actor == player || actor->IsDead(false)) {
+                continue;
             }
-        } else if (!g_loggedRows) {
-            runtime::logInfo("Collision: ROCK rows are not paired with sitting NPCs (npcDynamicCollisions off?); nothing changed");
+            const auto formId = actor->GetFormID();
+            const float gap = distance(actor->GetPosition(), player->GetPosition());
+            const bool wasSwitched = g_switched.contains(formId);
+            // Some slack before switching back, so NPCs at the edge do not flicker.
+            if (gap > (wasSwitched ? g_radius * 1.3f : g_radius)) {
+                continue;
+            }
+            stillNear.insert(formId);
+            const int moved = moveParts(actor, kLayerBiped, kLayerBipedNoCc);
+            if (g_faulted) {
+                return;
+            }
+            if (moved > 0 && g_loggedSwitches < 30) {
+                ++g_loggedSwitches;
+                char message[160]{};
+                std::snprintf(message, sizeof(message), "Collision: '%s' %d body parts now touchable (layer 8 -> 33)", nameOf(actor), moved);
+                runtime::logInfo(message);
+            }
         }
-        g_loggedRows = true;
+        // Put NPCs that walked away back on their own layer, unless they sat down.
+        for (auto it = g_switched.begin(); it != g_switched.end();) {
+            if (stillNear.contains(*it)) {
+                ++it;
+                continue;
+            }
+            auto* actor = RE::TESForm::GetFormByID<RE::Actor>(*it);
+            if (actor && actor->Get3D() && actor->DoGetSitSleepState() == RE::SIT_SLEEP_STATE::kNormal) {
+                (void)moveParts(actor, kLayerBipedNoCc, kLayerBiped);
+            }
+            it = g_switched.erase(it);
+        }
+        for (const auto formId : stillNear) {
+            g_switched.insert(formId);
+        }
     }
 
     void describeActor(RE::Actor* actor) noexcept
@@ -218,18 +293,26 @@ namespace npctouch::collision
             return;
         }
         std::uint32_t layers[128]{};
-        std::uint32_t bodies{ 0 };
+        std::uint32_t parts{ 0 };
         std::uint32_t unread{ 0 };
-        countLayers(root, layers, bodies, unread, 0);
+        auto visit = [&](RE::NiCollisionObject* collision) {
+            ++parts;
+            std::uint32_t info{ 0 };
+            if (filterInfoOf(collision, info) && info != 0xFFFF'FFFF) {
+                ++layers[info & kLayerMask];
+            } else {
+                ++unread;
+            }
+        };
+        forEachCollisionObject(root, visit);
 
         char message[512]{};
-        const char* name = actor->GetDisplayFullName();
         int length = std::snprintf(
             message,
             sizeof(message),
             "Collision bodies of '%s': %u parts (%u unreadable), sitState=%u, layers:",
-            name ? name : "?",
-            bodies,
+            nameOf(actor),
+            parts,
             unread,
             static_cast<std::uint32_t>(actor->DoGetSitSleepState()));
         for (std::uint32_t layer = 0; layer < 128 && length < static_cast<int>(sizeof(message)) - 16; ++layer) {
