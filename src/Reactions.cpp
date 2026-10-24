@@ -56,11 +56,11 @@ namespace npctouch::reactions
             float closeAffinity{ 1000.0f };
             // A hand moving at least this fast (game units/s) shoves the NPC.
             bool shoves{ true };
-            float shoveSpeed{ 110.0f };
+            float shoveSpeed{ 75.0f };
             // Faster still knocks the NPC over (ragdoll), if allowed.
             bool knockdowns{ true };
-            float knockdownSpeed{ 230.0f };
-            float knockdownForce{ 4.0f };
+            float knockdownSpeed{ 180.0f };
+            float knockdownForce{ 1.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };

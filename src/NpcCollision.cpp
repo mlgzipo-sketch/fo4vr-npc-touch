@@ -107,6 +107,19 @@ namespace npctouch::collision
             }
         }
 
+        // Body flags (+0x40) and motion index (+0x68), for diagnostics.
+        bool readBodyState(const BodyRef& body, std::uint32_t& flags, std::uint32_t& motion) noexcept
+        {
+            __try {
+                auto* bodies = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(body.world) + kWorldBodyArray);
+                flags = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + 0x40);
+                motion = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + 0x68);
+                return true;
+            } __except (1) {
+                return false;
+            }
+        }
+
         using SetFilterInfo = void (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
 
         bool writeFilter(const BodyRef& body, const std::uint32_t info) noexcept
@@ -285,7 +298,9 @@ namespace npctouch::collision
 
     void describeActor(RE::Actor* actor) noexcept
     {
-        if (!actor || g_describedActors.size() >= 16 || !g_describedActors.insert(actor->GetFormID()).second) {
+        // Sitting and standing are both worth a sample, so key by state too.
+        const auto key = actor ? actor->GetFormID() ^ (static_cast<std::uint32_t>(actor->DoGetSitSleepState()) << 28) : 0;
+        if (!actor || g_describedActors.size() >= 24 || !g_describedActors.insert(key).second) {
             return;
         }
         auto* root = actor->Get3D();
@@ -295,6 +310,9 @@ namespace npctouch::collision
         std::uint32_t layers[128]{};
         std::uint32_t parts{ 0 };
         std::uint32_t unread{ 0 };
+        char samples[256]{};
+        int sampleLength = 0;
+        int sampleCount = 0;
         auto visit = [&](RE::NiCollisionObject* collision) {
             ++parts;
             std::uint32_t info{ 0 };
@@ -302,6 +320,21 @@ namespace npctouch::collision
                 ++layers[info & kLayerMask];
             } else {
                 ++unread;
+            }
+            BodyRef body{};
+            std::uint32_t bodyInfo{ 0 };
+            std::uint32_t flags{ 0 };
+            std::uint32_t motion{ 0 };
+            if (sampleCount < 4 && resolveBody(collision, body) && readFilter(body, bodyInfo) && readBodyState(body, flags, motion)) {
+                ++sampleCount;
+                sampleLength += std::snprintf(
+                    samples + sampleLength,
+                    sizeof(samples) - sampleLength,
+                    " {id=%u filter=%08X flags=%08X motion=%u}",
+                    body.id,
+                    bodyInfo,
+                    flags,
+                    motion);
             }
         };
         forEachCollisionObject(root, visit);
@@ -320,6 +353,8 @@ namespace npctouch::collision
                 length += std::snprintf(message + length, sizeof(message) - length, " %u x%u", layer, layers[layer]);
             }
         }
+        runtime::logInfo(message);
+        std::snprintf(message, sizeof(message), "  body samples:%s", samples);
         runtime::logInfo(message);
     }
 }
