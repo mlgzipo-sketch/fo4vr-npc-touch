@@ -3,11 +3,11 @@
 //
 // Standing NPCs' own body parts take no part in collisions with ROCK's hand
 // proxies, whatever their layer or flags. ROCK 0.93 solves this the same way:
-// passive copies of the animated limbs. This file creates one keyframed sphere
-// per nearby NPC on the chest, on layer 33 (which ROCK's dynamic hands collide
-// with when npcDynamicCollisions = true) and in the NPC's own collision group,
-// so the NPC does not push against it. Every frame the sphere is driven to the
-// chest bone.
+// passive copies of the animated limbs. This file gives each nearby NPC a set
+// of keyframed capsules (torso, shoulders, head, arms, legs) between pairs of
+// bones, on layer 33 (which ROCK's dynamic hands collide with when
+// npcDynamicCollisions = true) and in the NPC's own collision group, so the NPC
+// does not push against them. Every frame each capsule is driven to its bones.
 //
 // Body creation follows ROCK's BethesdaPhysicsBody::create (GPL-3.0,
 // github.com/brunocatani/ROCK); offsets are for Fallout 4 VR 1.2.72.
@@ -59,7 +59,8 @@ namespace npctouch::proxies
         constexpr std::uintptr_t kNiNodeCtor = 0x1C17D30;
         constexpr std::uintptr_t kNiNodeSetName = 0x1C16C30;
         constexpr std::uintptr_t kBSFixedStringCreate = 0x1BC1650;
-        constexpr std::uintptr_t kCreateSphereShape = 0x15FF4E0;
+        constexpr std::uintptr_t kConvexBuildConfigInit = 0x16D4AB0;
+        constexpr std::uintptr_t kConvexShapeFromPoints = 0x16D4B30;
 
         // Body setup and motion.
         constexpr std::uintptr_t kSetBodyMaterial = 0x153AFC0;
@@ -94,27 +95,73 @@ namespace npctouch::proxies
         constexpr std::uint32_t kLayerBipedNoCc = 33;
         constexpr std::uint32_t kLayerMask = 0x7F;
         constexpr float kGameToHavok = 1.0f / 70.0f;
-        constexpr const char* kBodyName = "NpcTouch_ChestProxy";
+        constexpr const char* kBodyName = "NpcTouch_BodyProxy";
+
+        // One capsule between two bones. With no end bone the capsule runs from
+        // the start bone along the parent -> start direction for `extend` units
+        // (head, hands). Radii are in game units for a regular-size NPC.
+        struct Segment
+        {
+            const char* name;
+            const char* from;
+            const char* to;
+            const char* parent;
+            float extend;
+            float radius;
+        };
+        constexpr Segment kSegments[] = {
+            { "belly", "Pelvis", "SPINE2", nullptr, 0.0f, 12.0f },
+            { "chest", "SPINE2", "Neck", nullptr, 0.0f, 12.0f },
+            { "shoulders", "LArm_UpperArm", "RArm_UpperArm", nullptr, 0.0f, 6.5f },
+            { "head", "Head", nullptr, "Neck", 9.0f, 8.5f },
+            { "left upper arm", "LArm_UpperArm", "LArm_ForeArm1", nullptr, 0.0f, 4.5f },
+            { "left forearm", "LArm_ForeArm1", "LArm_Hand", nullptr, 0.0f, 3.8f },
+            { "left hand", "LArm_Hand", nullptr, "LArm_ForeArm1", 7.0f, 3.2f },
+            { "right upper arm", "RArm_UpperArm", "RArm_ForeArm1", nullptr, 0.0f, 4.5f },
+            { "right forearm", "RArm_ForeArm1", "RArm_Hand", nullptr, 0.0f, 3.8f },
+            { "right hand", "RArm_Hand", nullptr, "RArm_ForeArm1", 7.0f, 3.2f },
+            { "left thigh", "LLeg_Thigh", "LLeg_Calf", nullptr, 0.0f, 7.0f },
+            { "left calf", "LLeg_Calf", "LLeg_Foot", nullptr, 0.0f, 5.0f },
+            { "right thigh", "RLeg_Thigh", "RLeg_Calf", nullptr, 0.0f, 7.0f },
+            { "right calf", "RLeg_Calf", "RLeg_Foot", nullptr, 0.0f, 5.0f },
+        };
+        constexpr std::size_t kSegmentCount = sizeof(kSegments) / sizeof(kSegments[0]);
 
         bool g_enabled{ true };
         float g_range{ 150.0f };
-        float g_radius{ 13.0f };
-        std::uint32_t g_maxBodies{ 4 };
+        float g_radiusScale{ 1.0f };
+        bool g_legs{ true };
+        std::uint32_t g_maxNpcs{ 4 };
         bool g_faulted{ false };
         std::uint32_t g_logged{ 0 };
         std::chrono::steady_clock::time_point g_lastFrame{};
         std::chrono::steady_clock::time_point g_lastReport{};
 
+        struct Bones
+        {
+            RE::NiAVObject* from{ nullptr };
+            RE::NiAVObject* to{ nullptr };
+            RE::NiAVObject* parent{ nullptr };
+        };
+
         struct Proxy
         {
-            std::uint32_t formId{ 0 };
+            std::size_t segment{ 0 };
+            Bones bones;
             void* bhkWorld{ nullptr };
             void* world{ nullptr };
             void* collisionObject{ nullptr };
             void* physicsSystem{ nullptr };
             std::uint32_t bodyId{ kInvalidBodyId };
         };
-        std::vector<Proxy> g_proxies;
+        struct NpcBodies
+        {
+            std::uint32_t formId{ 0 };
+            void* bhkWorld{ nullptr };
+            RE::NiAVObject* root{ nullptr };  // bodies are rebuilt if the 3D changes
+            std::vector<Proxy> parts;
+        };
+        std::vector<NpcBodies> g_npcs;
 
         std::uintptr_t base() noexcept
         {
@@ -240,10 +287,33 @@ namespace npctouch::proxies
             static_cast<RE::NiRefObject*>(object)->DecRefCount();
         }
 
-        void* sphereShape(const float radiusHavok) noexcept
+        struct StridedPoints
         {
-            alignas(16) float center[4]{};
-            return at<void* (*)(float*, float)>(kCreateSphereShape)(center, radiusHavok);
+            const void* data;
+            std::int32_t count;
+            std::int32_t stride;
+        };
+
+        // Octagonal prism along local X, rounded by the convex radius: close
+        // enough to a capsule. Same point layout as ROCK's capsule-like hulls.
+        void* capsuleShapeRaw(const float halfLength, const float radius) noexcept
+        {
+            alignas(16) float points[16][4]{};
+            constexpr float d = 0.7071067f;
+            const float ring[8][2] = { { radius, 0 }, { -radius, 0 }, { 0, radius }, { 0, -radius }, { radius * d, radius * d }, { -radius * d, radius * d }, { radius * d, -radius * d }, { -radius * d, -radius * d } };
+            int count = 0;
+            for (const float x : { -halfLength, halfLength }) {
+                for (const auto& corner : ring) {
+                    points[count][0] = x * kGameToHavok;
+                    points[count][1] = corner[0] * kGameToHavok;
+                    points[count][2] = corner[1] * kGameToHavok;
+                    ++count;
+                }
+            }
+            alignas(16) std::uint8_t config[0x80]{};
+            at<void* (*)(void*)>(kConvexBuildConfigInit)(config);
+            const StridedPoints array{ points, count, static_cast<std::int32_t>(sizeof(points[0])) };
+            return at<void* (*)(const StridedPoints*, float, void*)>(kConvexShapeFromPoints)(&array, 1.0f * kGameToHavok, config);
         }
 
         // Steps of ROCK's BethesdaPhysicsBody::create, for one keyframed body.
@@ -364,10 +434,10 @@ namespace npctouch::proxies
             }
         }
 
-        void* createSphere(const float radiusHavok) noexcept
+        void* createCapsule(const float halfLength, const float radius) noexcept
         {
             __try {
-                return sphereShape(radiusHavok);
+                return capsuleShapeRaw(halfLength, radius);
             } __except (1) {
                 return nullptr;
             }
@@ -506,15 +576,55 @@ namespace npctouch::proxies
             return false;
         }
 
-        void identityAt(const RE::NiPoint3& point, float (&transform)[16]) noexcept
+        bool findBones(RE::NiAVObject* root, const Segment& segment, Bones& bones) noexcept
         {
+            bones.from = findNode(root, segment.from);
+            bones.to = segment.to ? findNode(root, segment.to) : nullptr;
+            bones.parent = segment.parent ? findNode(root, segment.parent) : nullptr;
+            return bones.from && (segment.to ? bones.to != nullptr : bones.parent != nullptr);
+        }
+
+        // Where a segment's capsule goes this frame: centre, local X along the
+        // bones. Returns false when the bones overlap.
+        bool segmentTransform(const Segment& segment, const Bones& bones, float (&transform)[16], float& halfLength) noexcept
+        {
+            const RE::NiPoint3 start = bones.from->world.translate;
+            RE::NiPoint3 end{};
+            if (bones.to) {
+                end = bones.to->world.translate;
+            } else {
+                RE::NiPoint3 direction = start - bones.parent->world.translate;
+                const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
+                if (length < 0.5f) {
+                    return false;
+                }
+                end = start + direction * (segment.extend / length);
+            }
+            RE::NiPoint3 axis = end - start;
+            const float length = std::sqrt(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+            if (length < 0.5f) {
+                return false;
+            }
+            axis = axis * (1.0f / length);
+            // Any perpendicular works for a round capsule; pick a stable one.
+            const RE::NiPoint3 reference = std::abs(axis.z) < 0.9f ? RE::NiPoint3{ 0.0f, 0.0f, 1.0f } : RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
+            RE::NiPoint3 side{ reference.y * axis.z - reference.z * axis.y, reference.z * axis.x - reference.x * axis.z, reference.x * axis.y - reference.y * axis.x };
+            const float sideLength = std::sqrt(side.x * side.x + side.y * side.y + side.z * side.z);
+            side = side * (1.0f / sideLength);
+            const RE::NiPoint3 up{ axis.y * side.z - axis.z * side.y, axis.z * side.x - axis.x * side.z, axis.x * side.y - axis.y * side.x };
+            const RE::NiPoint3 centre = (start + end) * 0.5f;
             std::memset(transform, 0, sizeof(transform));
-            transform[0] = 1.0f;
-            transform[5] = 1.0f;
-            transform[10] = 1.0f;
-            transform[12] = point.x * kGameToHavok;
-            transform[13] = point.y * kGameToHavok;
-            transform[14] = point.z * kGameToHavok;
+            const RE::NiPoint3* columns[3] = { &axis, &side, &up };
+            for (int column = 0; column < 3; ++column) {
+                transform[column * 4 + 0] = columns[column]->x;
+                transform[column * 4 + 1] = columns[column]->y;
+                transform[column * 4 + 2] = columns[column]->z;
+            }
+            transform[12] = centre.x * kGameToHavok;
+            transform[13] = centre.y * kGameToHavok;
+            transform[14] = centre.z * kGameToHavok;
+            halfLength = length * 0.5f;
+            return true;
         }
 
         float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
@@ -539,8 +649,82 @@ namespace npctouch::proxies
             g_faulted = true;
         }
 
-        void* g_shape{ nullptr };
-        float g_shapeRadius{ 0.0f };
+        bool isLeg(const Segment& segment) noexcept
+        {
+            return std::strstr(segment.name, "thigh") || std::strstr(segment.name, "calf");
+        }
+
+        // Removes all bodies of one NPC; false if the game faulted.
+        bool removeNpc(const NpcBodies& npc) noexcept
+        {
+            for (const auto& part : npc.parts) {
+                if (!removeBody(part)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Builds every capsule for one NPC. Missing bones just skip a part.
+        bool createNpc(RE::Actor* actor, void* world, void* bhkWorld, NpcBodies& out) noexcept
+        {
+            auto* root = actor->Get3D();
+            std::uint32_t npcFilter{ 0 };
+            std::uint16_t material{ 0 };
+            void* npcWorld{ nullptr };
+            if (!root || !actorCollisionInfo(root, npcFilter, material, npcWorld) || npcWorld != world) {
+                return true;
+            }
+            const std::uint32_t filter = (npcFilter & 0xFFFF'0000u) | kLayerBipedNoCc;
+            out.formId = actor->GetFormID();
+            out.bhkWorld = bhkWorld;
+            out.root = root;
+            for (std::size_t index = 0; index < kSegmentCount; ++index) {
+                const auto& segment = kSegments[index];
+                if (!g_legs && isLeg(segment)) {
+                    continue;
+                }
+                Bones bones{};
+                float transform[16]{};
+                float halfLength{ 0.0f };
+                if (!findBones(root, segment, bones) || !segmentTransform(segment, bones, transform, halfLength)) {
+                    continue;
+                }
+                const float radius = segment.radius * g_radiusScale;
+                auto* shape = createCapsule(halfLength, radius);
+                if (!shape) {
+                    fault("building a capsule shape");
+                    return false;
+                }
+                Proxy part{};
+                part.segment = index;
+                part.bones = bones;
+                const int step = createBody(world, bhkWorld, shape, filter, material, part);
+                if (step != 0) {
+                    char message[200]{};
+                    std::snprintf(message, sizeof(message), "Proxy bodies: creating '%s' for '%s' failed at step %d", segment.name, nameOf(actor), step);
+                    runtime::logWarning(message);
+                    fault("creating a body");
+                    return false;
+                }
+                if (!placeBody(part, transform, 0.0f, true)) {
+                    fault("placing a new body");
+                    return false;
+                }
+                out.parts.push_back(part);
+            }
+            char message[200]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "Proxy bodies: '%s' got %zu capsules (filter %08X, material %u)",
+                nameOf(actor),
+                out.parts.size(),
+                filter,
+                material);
+            logLimited(message);
+            return true;
+        }
     }
 
     void initialize() noexcept
@@ -562,10 +746,12 @@ namespace npctouch::proxies
                     g_enabled = value != 0.0f;
                 } else if (key == "fProxyRange" && value > 0.0f) {
                     g_range = value;
-                } else if (key == "fChestProxyRadius" && value > 1.0f) {
-                    g_radius = value;
+                } else if (key == "fProxyThickness" && value > 0.1f) {
+                    g_radiusScale = value;
+                } else if (key == "bProxyLegs") {
+                    g_legs = value != 0.0f;
                 } else if (key == "iMaxProxyNPCs" && value >= 1.0f) {
-                    g_maxBodies = static_cast<std::uint32_t>(value);
+                    g_maxNpcs = static_cast<std::uint32_t>(value);
                 }
             }
         } catch (...) {
@@ -574,11 +760,12 @@ namespace npctouch::proxies
         std::snprintf(
             message,
             sizeof(message),
-            "NPC proxy bodies: %s, range %.0f, chest radius %.0f, up to %u NPCs",
+            "NPC proxy bodies: %s, range %.0f, thickness x%.2f, legs %d, up to %u NPCs",
             g_enabled ? "on" : "off",
             g_range,
-            g_radius,
-            g_maxBodies);
+            g_radiusScale,
+            g_legs ? 1 : 0,
+            g_maxNpcs);
         runtime::logInfo(message);
     }
 
@@ -594,7 +781,7 @@ namespace npctouch::proxies
 
         if (!worldAvailable) {
             // The world is going away and takes our bodies with it.
-            g_proxies.clear();
+            g_npcs.clear();
             return;
         }
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -602,7 +789,7 @@ namespace npctouch::proxies
         auto* cell = player ? player->GetParentCell() : nullptr;
         void* bhkWorld = cell ? cell->GetbhkWorld() : nullptr;
         if (!lists || !bhkWorld) {
-            g_proxies.clear();
+            g_npcs.clear();
             return;
         }
         void* world = hknpWorldOf(bhkWorld);
@@ -610,140 +797,116 @@ namespace npctouch::proxies
             return;
         }
         // A new physics world (another cell) means the old bodies are gone.
-        if (!g_proxies.empty() && g_proxies.front().bhkWorld != bhkWorld) {
+        if (!g_npcs.empty() && g_npcs.front().bhkWorld != bhkWorld) {
             logLimited("Proxy bodies: physics world changed, dropping old bodies");
-            g_proxies.clear();
+            g_npcs.clear();
         }
 
-        // NPCs near enough to touch, nearest first.
+        // NPCs near enough to touch, nearest first. NPCs that already have
+        // bodies keep them a little further out, so they do not flicker.
         struct Candidate
         {
             RE::Actor* actor;
-            RE::NiAVObject* chest;
             float gap;
         };
         std::vector<Candidate> candidates;
         for (const auto& handle : lists->highActorHandles) {
             auto actorPtr = handle.get();
             auto* actor = actorPtr.get();
-            if (!actor || actor == player || actor->IsDead(false) || actor->GetParentCell() != cell) {
+            if (!actor || actor == player || actor->IsDead(false) || actor->GetParentCell() != cell || !actor->Get3D()) {
                 continue;
             }
+            const auto formId = actor->GetFormID();
+            const bool has = std::any_of(g_npcs.begin(), g_npcs.end(), [&](const NpcBodies& n) { return n.formId == formId; });
             const float gap = distance(actor->GetPosition(), player->GetPosition());
-            if (gap > g_range) {
-                continue;
-            }
-            auto* root = actor->Get3D();
-            auto* chest = root ? findNode(root, "Chest") : nullptr;
-            if (chest) {
-                candidates.push_back({ actor, chest, gap });
+            if (gap <= (has ? g_range + 60.0f : g_range)) {
+                candidates.push_back({ actor, gap });
             }
         }
         std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.gap < b.gap; });
-        if (candidates.size() > g_maxBodies) {
-            candidates.resize(g_maxBodies);
+        if (candidates.size() > g_maxNpcs) {
+            candidates.resize(g_maxNpcs);
         }
 
         // Remove bodies of NPCs that are no longer close.
-        for (auto it = g_proxies.begin(); it != g_proxies.end();) {
-            const bool keep = std::any_of(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.actor->GetFormID() == it->formId; });
+        for (auto it = g_npcs.begin(); it != g_npcs.end();) {
+            const bool keep = std::any_of(candidates.begin(), candidates.end(), [&](const Candidate& c) {
+                return c.actor->GetFormID() == it->formId && c.actor->Get3D() == it->root;
+            });
             if (keep) {
                 ++it;
                 continue;
             }
-            if (!removeBody(*it)) {
+            if (!removeNpc(*it)) {
                 fault("removing a body");
                 return;
             }
             char message[128]{};
-            std::snprintf(message, sizeof(message), "Proxy bodies: removed body %u of NPC %08X", it->bodyId, it->formId);
+            std::snprintf(message, sizeof(message), "Proxy bodies: removed %zu capsules of NPC %08X", it->parts.size(), it->formId);
             logLimited(message);
-            it = g_proxies.erase(it);
-        }
-
-        if (!g_shape || g_shapeRadius != g_radius) {
-            g_shape = createSphere(g_radius * kGameToHavok);
-            g_shapeRadius = g_radius;
-            if (!g_shape) {
-                fault("creating the sphere shape");
-                return;
-            }
+            it = g_npcs.erase(it);
         }
 
         bool createdThisFrame = false;
         for (const auto& candidate : candidates) {
             const auto formId = candidate.actor->GetFormID();
-            auto existing = std::find_if(g_proxies.begin(), g_proxies.end(), [&](const Proxy& p) { return p.formId == formId; });
-            float transform[16]{};
-            identityAt(candidate.chest->world.translate, transform);
-            if (existing != g_proxies.end()) {
-                if (!placeBody(*existing, transform, dt, false)) {
-                    fault("moving a body");
+            auto existing = std::find_if(g_npcs.begin(), g_npcs.end(), [&](const NpcBodies& n) { return n.formId == formId; });
+            if (existing == g_npcs.end()) {
+                // One new NPC per frame keeps a crowd from stalling a frame.
+                if (createdThisFrame) {
+                    continue;
+                }
+                createdThisFrame = true;
+                NpcBodies npc{};
+                if (!createNpc(candidate.actor, world, bhkWorld, npc)) {
                     return;
+                }
+                if (!npc.parts.empty()) {
+                    g_npcs.push_back(std::move(npc));
                 }
                 continue;
             }
-            // One new body per frame keeps a crowd from stalling a frame.
-            if (createdThisFrame) {
-                continue;
+            for (const auto& part : existing->parts) {
+                float transform[16]{};
+                float halfLength{ 0.0f };
+                if (!segmentTransform(kSegments[part.segment], part.bones, transform, halfLength)) {
+                    continue;
+                }
+                if (!placeBody(part, transform, dt, false)) {
+                    fault("moving a body");
+                    return;
+                }
             }
-            createdThisFrame = true;
-            std::uint32_t npcFilter{ 0 };
-            std::uint16_t material{ 0 };
-            void* npcWorld{ nullptr };
-            if (!actorCollisionInfo(candidate.actor->Get3D(), npcFilter, material, npcWorld) || npcWorld != world) {
-                continue;
-            }
-            const std::uint32_t filter = (npcFilter & 0xFFFF'0000u) | kLayerBipedNoCc;
-            Proxy proxy{};
-            proxy.formId = formId;
-            const int step = createBody(world, bhkWorld, g_shape, filter, material, proxy);
-            char message[200]{};
-            if (step != 0) {
-                std::snprintf(message, sizeof(message), "Proxy bodies: creating a body for '%s' failed at step %d", nameOf(candidate.actor), step);
-                runtime::logWarning(message);
-                fault("creating a body");
-                return;
-            }
-            if (!placeBody(proxy, transform, dt, true)) {
-                fault("placing a new body");
-                return;
-            }
-            g_proxies.push_back(proxy);
-            std::snprintf(
-                message,
-                sizeof(message),
-                "Proxy bodies: '%s' got chest body %u (filter %08X, material %u, radius %.0f)",
-                nameOf(candidate.actor),
-                proxy.bodyId,
-                filter,
-                material,
-                g_radius);
-            logLimited(message);
         }
 
         // Every few seconds, show whether the bodies keep up with the bones.
-        if (!g_proxies.empty() && now - g_lastReport > std::chrono::seconds(5)) {
+        if (!g_npcs.empty() && now - g_lastReport > std::chrono::seconds(5)) {
             g_lastReport = now;
-            const auto& proxy = g_proxies.front();
-            const auto match = std::find_if(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.actor->GetFormID() == proxy.formId; });
-            float position[3]{};
-            if (match != candidates.end() && readBodyPosition(proxy, position)) {
-                const auto& bone = match->chest->world.translate;
-                char message[200]{};
-                std::snprintf(
-                    message,
-                    sizeof(message),
-                    "Proxy bodies: %zu active; '%s' chest bone (%.0f, %.0f, %.0f) body (%.0f, %.0f, %.0f)",
-                    g_proxies.size(),
-                    nameOf(match->actor),
-                    bone.x,
-                    bone.y,
-                    bone.z,
-                    position[0],
-                    position[1],
-                    position[2]);
-                logLimited(message);
+            const auto& npc = g_npcs.front();
+            auto* actor = RE::TESForm::GetFormByID<RE::Actor>(npc.formId);
+            for (const auto& part : npc.parts) {
+                if (part.segment != 1) {
+                    continue;
+                }
+                float transform[16]{};
+                float halfLength{ 0.0f };
+                float position[3]{};
+                if (segmentTransform(kSegments[part.segment], part.bones, transform, halfLength) && readBodyPosition(part, position)) {
+                    char message[200]{};
+                    std::snprintf(
+                        message,
+                        sizeof(message),
+                        "Proxy bodies: %zu NPCs; '%s' chest target (%.0f, %.0f, %.0f) body (%.0f, %.0f, %.0f)",
+                        g_npcs.size(),
+                        nameOf(actor),
+                        transform[12] / kGameToHavok,
+                        transform[13] / kGameToHavok,
+                        transform[14] / kGameToHavok,
+                        position[0],
+                        position[1],
+                        position[2]);
+                    logLimited(message);
+                }
             }
         }
     }
