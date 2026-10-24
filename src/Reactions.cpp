@@ -187,6 +187,9 @@ namespace npctouch::reactions
         // The Papyrus calls go through reverse-engineered VM entry points, and
         // the first VR test faulted inside the VM. Run each step under SEH so a
         // fault only switches the reactions off and names the step in the log.
+        // Papyrus functions that faulted once; they are not called again.
+        std::unordered_set<std::string> g_brokenFunctions;
+
         bool runGuarded(void (*step)(void*), void* context) noexcept
         {
             __try {
@@ -203,14 +206,15 @@ namespace npctouch::reactions
             if (runGuarded([](void* context) { (*static_cast<F*>(context))(); }, &step)) {
                 return true;
             }
-            g_papyrusAvailable = false;
+            g_brokenFunctions.insert(function);
             char message[160]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "Papyrus %s faulted at step '%s'; NPC speech and head turning are now off",
+                "Papyrus %s faulted at step '%s'; Actor.%s is now off, other calls continue",
                 function,
-                stepName);
+                stepName,
+                function);
             runtime::logWarning(message);
             return false;
         }
@@ -223,7 +227,8 @@ namespace npctouch::reactions
         {
             RE::BSScript::IVirtualMachine* vm{ nullptr };
             auto findVm = [&]() { vm = virtualMachine(); };
-            if (!g_papyrusAvailable || !actor || !guarded(function, "vm", findVm) || !vm) {
+            if (!g_papyrusAvailable || !actor || g_brokenFunctions.contains(function) ||
+                !guarded(function, "vm", findVm) || !vm) {
                 return false;
             }
 
@@ -244,6 +249,25 @@ namespace npctouch::reactions
                 hasHandle = handle != policy.EmptyHandle();
             };
             if (!guarded(function, "handle", findHandle) || !hasHandle) {
+                return false;
+            }
+
+            // Pack each argument on its own first so a fault names the argument.
+            bool packed{ true };
+            int argument{ 0 };
+            (
+                [&]() {
+                    if (!packed) {
+                        return;
+                    }
+                    ++argument;
+                    auto pack = [&]() { (void)RE::BSScript::detail::PackVariables(args); };
+                    char stepName[32]{};
+                    std::snprintf(stepName, sizeof(stepName), "pack argument %d", argument);
+                    packed = guarded(function, stepName, pack);
+                }(),
+                ...);
+            if (!packed) {
                 return false;
             }
 
