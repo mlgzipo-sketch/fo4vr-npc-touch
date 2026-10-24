@@ -298,29 +298,43 @@ namespace npctouch::reactions
             if (!vm || !topic || g_brokenFunctions.contains("TopicObject")) {
                 return object;
             }
-            auto bind = [&]() {
-                constexpr auto type = static_cast<std::uint32_t>(RE::TESTopic::FORM_ID);
-                RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> typeInfo;
-                if (!vm->GetScriptObjectType(type, typeInfo) || !typeInfo) {
-                    return;
-                }
+            constexpr auto type = static_cast<std::uint32_t>(RE::TESTopic::FORM_ID);
+            RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> typeInfo;
+            bool ok{ false };
+            auto findType = [&]() { ok = vm->GetScriptObjectType(type, typeInfo) && typeInfo; };
+            if (!guarded("TopicObject", "type info", findType) || !ok) {
+                return object;
+            }
+            std::size_t handle{ 0 };
+            auto findHandle = [&]() {
                 const auto& policy = vm->GetObjectHandlePolicy();
-                const auto handle = policy.GetHandleForObject(type, topic);
-                if (handle == policy.EmptyHandle()) {
-                    return;
-                }
-                if (vm->FindBoundObject(handle, typeInfo->name.c_str(), false, object, false) && object) {
-                    return;
-                }
-                if (!vm->CreateObject(typeInfo->name, object) || !object) {
-                    return;
-                }
+                handle = policy.GetHandleForObject(type, topic);
+                ok = handle != policy.EmptyHandle();
+            };
+            if (!guarded("TopicObject", "handle", findHandle) || !ok) {
+                return object;
+            }
+            auto find = [&]() { ok = vm->FindBoundObject(handle, typeInfo->name.c_str(), false, object, false) && object; };
+            if (!guarded("TopicObject", "find bound", find)) {
+                return nullptr;
+            }
+            if (ok) {
+                return object;
+            }
+            auto create = [&]() { ok = vm->CreateObject(typeInfo->name, object) && object; };
+            if (!guarded("TopicObject", "create", create) || !ok) {
+                return nullptr;
+            }
+            auto bind = [&]() {
                 auto* internal = static_cast<RE::BSScript::Internal::VirtualMachine*>(vm);
                 static_cast<RE::BSScript::IVMObjectBindInterface*>(internal)->BindObject(object, handle, false);
             };
-            if (!guarded("TopicObject", "bind topic", bind)) {
-                object = nullptr;
+            if (!guarded("TopicObject", "bind", bind)) {
+                return nullptr;
             }
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "Topic %08X bound to a new script object (handle %llX)", topic->GetFormID(), static_cast<unsigned long long>(handle));
+            runtime::logInfo(message);
             return object;
         }
 
