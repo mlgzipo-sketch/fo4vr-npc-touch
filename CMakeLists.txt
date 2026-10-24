@@ -38,6 +38,8 @@ add_library(NpcTouch SHARED
   src/Runtime.h
   src/NpcCollision.cpp
   src/NpcCollision.h
+  src/NpcProxyBodies.cpp
+  src/NpcProxyBodies.h
   src/NpcTouch.cpp
   src/Reactions.cpp
   src/Reactions.h

@@ -50,7 +50,9 @@ namespace npctouch::collision
         constexpr std::uintptr_t kDisableBodyFlags = 0x153C150;
         constexpr std::uintptr_t kActivateBody = 0x1546EF0;
 
-        bool g_enabled{ true };
+        // Off by default: hands still passed through standing NPCs on layer 33.
+        // NpcProxyBodies.cpp does the job now.
+        bool g_enabled{ false };
         float g_radius{ 200.0f };
         // Body flags that differ between a standing NPC whose parts hands pass
         // through (00011486) and a sitting one they stop against (0007008E).
@@ -300,7 +302,7 @@ namespace npctouch::collision
                     g_setFlags = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
                 } else if (key == "bWakeNPCBodies") {
                     g_activate = value != 0.0f;
-                } else if (key == "bHandsCollideWithNPCs") {
+                } else if (key == "bSwitchBodyLayers") {
                     g_enabled = value != 0.0f;
                 } else if (key == "fCollisionRadius" && value > 0.0f) {
                     g_radius = value;
@@ -312,7 +314,7 @@ namespace npctouch::collision
         std::snprintf(
             message,
             sizeof(message),
-            "NPC hand collision: %s, radius %.0f, clear flags %08X, set flags %08X, wake %d",
+            "NPC body layer switch: %s, radius %.0f, clear flags %08X, set flags %08X, wake %d",
             g_enabled ? "on" : "off",
             g_radius,
             g_clearFlags,

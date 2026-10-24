@@ -9,6 +9,7 @@
 #include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
 #include "NpcCollision.h"
+#include "NpcProxyBodies.h"
 #include "Reactions.h"
 #include "Runtime.h"
 
@@ -668,6 +669,7 @@ namespace
         if (!reactionsReady) {
             npctouch::reactions::initialize();
             npctouch::collision::initialize();
+            npctouch::proxies::initialize();
             reactionsReady = true;
         }
         return true;
@@ -691,9 +693,11 @@ namespace
         pollFingerContacts(ownerToken, rock::api::Hand::Left);
         proximity::update(ownerToken);
         npctouch::reactions::update();
-        npctouch::collision::update(npctouch::runtime::hasLifecycleFlag(
+        const bool worldAvailable = npctouch::runtime::hasLifecycleFlag(
             snapshot.lifecycleFlags,
-            rock::api::core::LifecycleFlag::WorldAvailable));
+            rock::api::core::LifecycleFlag::WorldAvailable);
+        npctouch::collision::update(worldAvailable);
+        npctouch::proxies::update(worldAvailable);
         logSummary();
         publishOverlay(ownerToken, snapshot);
     }
