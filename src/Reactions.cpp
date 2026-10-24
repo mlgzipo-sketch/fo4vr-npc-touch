@@ -40,12 +40,13 @@ namespace npctouch::reactions
             float annoyanceDecayPerMinute{ 4.0f };
             float speechCooldownSeconds{ 4.0f };
             float lookAtSeconds{ 3.0f };
+            // DialogueGeneric "Hit": short "Hey!" style lines for all common voices.
+            std::uint32_t lineTopic{ 0x000219CC };
+            // DialogueGenericCitizens "Pickpocket caught": "get your hands off me" style lines.
+            std::uint32_t warningTopic{ 0x000711BB };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
-
-        // DialogueGeneric "Hit" topic: short "Hey!" style lines for all voices.
-        constexpr std::uint32_t kGenericHitTopic = 0x000219CC;
 
         struct Companion
         {
@@ -134,6 +135,10 @@ namespace npctouch::reactions
                         g_settings.speechCooldownSeconds = number;
                     } else if (key == "fLookAtSeconds") {
                         g_settings.lookAtSeconds = number;
+                    } else if (key == "sLineTopic") {
+                        g_settings.lineTopic = static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 16));
+                    } else if (key == "sWarningTopic") {
+                        g_settings.warningTopic = static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 16));
                     }
                 }
             } catch (...) {
@@ -144,14 +149,16 @@ namespace npctouch::reactions
             std::snprintf(
                 message,
                 sizeof(message),
-                "Reactions: enabled=%d combat=%d companionsSpeak=%d warning=%.1f combatAt=%.1f decay=%.1f/min cooldown=%.1fs",
+                "Reactions: enabled=%d combat=%d companionsSpeak=%d warning=%.1f combatAt=%.1f decay=%.1f/min cooldown=%.1fs line=%08X warningLine=%08X",
                 g_settings.enabled,
                 g_settings.allowCombat,
                 g_settings.companionsSpeak,
                 g_settings.annoyanceForWarning,
                 g_settings.annoyanceForCombat,
                 g_settings.annoyanceDecayPerMinute,
-                g_settings.speechCooldownSeconds);
+                g_settings.speechCooldownSeconds,
+                g_settings.lineTopic,
+                g_settings.warningTopic);
             runtime::logInfo(message);
         }
 
@@ -485,13 +492,15 @@ namespace npctouch::reactions
         const bool canSpeak = now - state.lastSpeech >=
                               std::chrono::milliseconds(static_cast<int>(g_settings.speechCooldownSeconds * 1000.0f));
         const char* action = "look";
+        std::uint32_t spoken{ 0 };
 
         if (friendly) {
             // Companions are never angered by touches.
             if (g_settings.companionsSpeak && canSpeak) {
-                const auto topic = companion && companion->hitTopic ? companion->hitTopic : kGenericHitTopic;
+                const auto topic = companion && companion->hitTopic ? companion->hitTopic : g_settings.lineTopic;
                 if (say(npc, topic)) {
                     state.lastSpeech = now;
+                    spoken = topic;
                     action = "companion line";
                 }
             }
@@ -503,10 +512,13 @@ namespace npctouch::reactions
                     action = "start combat";
                 }
             } else if (canSpeak || (!state.warned && state.annoyance >= g_settings.annoyanceForWarning)) {
-                if (say(npc, kGenericHitTopic)) {
+                const bool warning = state.annoyance >= g_settings.annoyanceForWarning;
+                const auto topic = warning && g_settings.warningTopic ? g_settings.warningTopic : g_settings.lineTopic;
+                if (say(npc, topic)) {
                     state.lastSpeech = now;
-                    action = state.annoyance >= g_settings.annoyanceForWarning ? "warning line" : "line";
-                    state.warned = state.annoyance >= g_settings.annoyanceForWarning;
+                    spoken = topic;
+                    action = warning ? "warning line" : "line";
+                    state.warned = warning;
                 }
             }
         }
@@ -515,12 +527,13 @@ namespace npctouch::reactions
         std::snprintf(
             message,
             sizeof(message),
-            "REACTION: '%s' %s zone=%s annoyance=%.1f -> %s",
+            "REACTION: '%s' %s zone=%s annoyance=%.1f -> %s topic=%08X",
             actorName(npc),
             friendly ? "companion" : "npc",
             zoneName(zone),
             state.annoyance,
-            action);
+            action,
+            spoken);
         runtime::logInfo(message);
     }
 
