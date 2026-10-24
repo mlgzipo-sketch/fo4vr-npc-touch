@@ -184,24 +184,83 @@ namespace npctouch::reactions
             return game ? game->GetVM().get() : nullptr;
         }
 
+        // The Papyrus calls go through reverse-engineered VM entry points, and
+        // the first VR test faulted inside the VM. Run each step under SEH so a
+        // fault only switches the reactions off and names the step in the log.
+        bool runGuarded(void (*step)(void*), void* context) noexcept
+        {
+            __try {
+                step(context);
+                return true;
+            } __except (1) {
+                return false;
+            }
+        }
+
+        template <class F>
+        bool guarded(const char* function, const char* stepName, F& step) noexcept
+        {
+            if (runGuarded([](void* context) { (*static_cast<F*>(context))(); }, &step)) {
+                return true;
+            }
+            g_papyrusAvailable = false;
+            char message[160]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "Papyrus %s faulted at step '%s'; NPC speech and head turning are now off",
+                function,
+                stepName);
+            runtime::logWarning(message);
+            return false;
+        }
+
+        std::uint32_t g_loggedCalls{ 0 };
+
         // Calls a native Papyrus method on the actor, e.g. Actor.Say(...).
         template <class... Args>
         bool callActor(RE::Actor* actor, const char* function, Args... args) noexcept
         {
-            auto* vm = virtualMachine();
-            if (!g_papyrusAvailable || !vm || !actor) {
+            RE::BSScript::IVirtualMachine* vm{ nullptr };
+            auto findVm = [&]() { vm = virtualMachine(); };
+            if (!g_papyrusAvailable || !actor || !guarded(function, "vm", findVm) || !vm) {
                 return false;
             }
+
             // Packing the actor binds a script object to it if none exists yet.
-            RE::BSScript::Variable self;
-            RE::BSScript::PackVariable(self, static_cast<const RE::Actor*>(actor));
-            const auto handle = vm->GetObjectHandlePolicy().GetHandleForObject(
-                static_cast<std::uint32_t>(RE::Actor::FORM_ID),
-                actor);
-            if (handle == vm->GetObjectHandlePolicy().EmptyHandle()) {
+            auto bind = [&]() {
+                RE::BSScript::Variable self;
+                RE::BSScript::PackVariable(self, static_cast<const RE::Actor*>(actor));
+            };
+            if (!guarded(function, "bind", bind)) {
                 return false;
             }
-            return Papyrus::detail::DispatchMethodCall(vm, handle, "Actor", function, nullptr, args...);
+
+            std::size_t handle{ 0 };
+            bool hasHandle{ false };
+            auto findHandle = [&]() {
+                const auto& policy = vm->GetObjectHandlePolicy();
+                handle = policy.GetHandleForObject(static_cast<std::uint32_t>(RE::Actor::FORM_ID), actor);
+                hasHandle = handle != policy.EmptyHandle();
+            };
+            if (!guarded(function, "handle", findHandle) || !hasHandle) {
+                return false;
+            }
+
+            bool dispatched{ false };
+            auto dispatch = [&]() {
+                dispatched = Papyrus::detail::DispatchMethodCall(vm, handle, "Actor", function, nullptr, args...);
+            };
+            if (!guarded(function, "dispatch", dispatch)) {
+                return false;
+            }
+            if (g_loggedCalls < 20) {
+                ++g_loggedCalls;
+                char message[128]{};
+                std::snprintf(message, sizeof(message), "Papyrus Actor.%s queued=%d", function, dispatched);
+                runtime::logInfo(message);
+            }
+            return dispatched;
         }
 
         bool say(RE::Actor* actor, const std::uint32_t topicId) noexcept
