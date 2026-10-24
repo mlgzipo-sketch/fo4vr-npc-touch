@@ -1,4 +1,4 @@
-// NpcTouch, step 1: log every time the player's hands touch an NPC.
+// NpcTouch, step 2: log every time the player's hands touch an NPC.
 // This build also logs non-NPC touches to diagnose what ROCK reports.
 //
 // ROCK owns hand physics. This plugin only reads ROCK's collision events and
@@ -12,10 +12,12 @@
 
 #include <RE/Fallout.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -50,6 +52,9 @@ namespace
         float nearestGap{ -1.0f };
         char nearestBone[32]{};
         char nearestName[48]{};
+        float actorPosition[3]{};
+        float bonePosition[3]{};
+        bool usedCapsule{ false };
     } g_diag{};
     std::uint64_t g_lostEventCount{ 0 };
     Clock::time_point g_lastSummary{};
@@ -370,6 +375,46 @@ namespace
             float gap{ 0.0f };  // distance minus bone radius; negative means inside
         };
 
+        // Walks the scene graph by name. Avoids the virtual GetObjectByName,
+        // whose result had an all-zero world transform in Fallout 4 VR.
+        RE::NiAVObject* findNode(RE::NiAVObject* object, const char* name, const int depth = 0) noexcept
+        {
+            if (!object || depth > 64) {
+                return nullptr;
+            }
+            const auto objectName = object->GetName();
+            if (objectName.size() == std::strlen(name) && _strnicmp(objectName.data(), name, objectName.size()) == 0) {
+                return object;
+            }
+            auto* node = object->IsNode();
+            if (!node) {
+                return nullptr;
+            }
+            auto& children = node->GetRuntimeData().children;
+            for (std::uint16_t index = 0; index < children.size(); ++index) {
+                if (auto* found = findNode(children[index].get(), name, depth + 1)) {
+                    return found;
+                }
+            }
+            return nullptr;
+        }
+
+        bool isUsablePosition(const RE::NiPoint3& point) noexcept
+        {
+            return std::abs(point.x) + std::abs(point.y) + std::abs(point.z) > 1.0f;
+        }
+
+        // Rough body used when no bone has a usable position: a vertical
+        // segment from the NPC's feet to head height.
+        constexpr float kCapsuleHeight = 120.0f;
+        constexpr float kCapsuleRadius = 18.0f;
+
+        float capsuleGap(const RE::NiPoint3& hand, const RE::NiPoint3& feet) noexcept
+        {
+            const float z = std::clamp(hand.z, feet.z + 10.0f, feet.z + kCapsuleHeight);
+            return distance(hand, RE::NiPoint3{ feet.x, feet.y, z }) - kCapsuleRadius;
+        }
+
         Hit nearestBone(const RE::NiPoint3& hand, RE::Actor* player) noexcept
         {
             Hit best{};
@@ -384,23 +429,37 @@ namespace
                     continue;
                 }
                 ++g_diag.nearbyActors;
-                auto* root = actor->Get3D();
-                if (!root) {
-                    continue;
+                const auto feet = actor->GetPosition();
+                bool anyBone = false;
+                if (auto* root = actor->Get3D()) {
+                    for (const auto& bone : kBones) {
+                        auto* node = findNode(root, bone.name);
+                        if (!node || !isUsablePosition(node->world.translate)) {
+                            continue;
+                        }
+                        anyBone = true;
+                        const auto& point = node->world.translate;
+                        const float gap = distance(hand, point) - bone.radius;
+                        if (!best.actor || gap < best.gap) {
+                            best = Hit{ actor, bone.name, gap };
+                            g_diag.bonePosition[0] = point.x;
+                            g_diag.bonePosition[1] = point.y;
+                            g_diag.bonePosition[2] = point.z;
+                            g_diag.actorPosition[0] = feet.x;
+                            g_diag.actorPosition[1] = feet.y;
+                            g_diag.actorPosition[2] = feet.z;
+                            g_diag.usedCapsule = false;
+                        }
+                    }
                 }
-                for (const auto& bone : kBones) {
-                    static std::array<RE::BSFixedString, kBones.size()> names{};
-                    const auto index = static_cast<std::size_t>(&bone - kBones.data());
-                    if (names[index].empty()) {
-                        names[index] = bone.name;
-                    }
-                    auto* node = root->GetObjectByName(names[index]);
-                    if (!node) {
-                        continue;
-                    }
-                    const float gap = distance(hand, node->world.translate) - bone.radius;
+                if (!anyBone) {
+                    const float gap = capsuleGap(hand, feet);
                     if (!best.actor || gap < best.gap) {
-                        best = Hit{ actor, bone.name, gap };
+                        best = Hit{ actor, "Body", gap };
+                        g_diag.actorPosition[0] = feet.x;
+                        g_diag.actorPosition[1] = feet.y;
+                        g_diag.actorPosition[2] = feet.z;
+                        g_diag.usedCapsule = true;
                     }
                 }
             }
@@ -501,6 +560,19 @@ namespace
             g_diag.nearestBone,
             g_diag.nearestGap);
         npctouch::runtime::logInfo(detail);
+        char where[256]{};
+        std::snprintf(
+            where,
+            sizeof(where),
+            "  nearest NPC at (%.0f, %.0f, %.0f) bone at (%.0f, %.0f, %.0f) source=%s",
+            g_diag.actorPosition[0],
+            g_diag.actorPosition[1],
+            g_diag.actorPosition[2],
+            g_diag.bonePosition[0],
+            g_diag.bonePosition[1],
+            g_diag.bonePosition[2],
+            g_diag.usedCapsule ? "capsule" : "skeleton");
+        npctouch::runtime::logInfo(where);
         g_diag.contactsSeen = 0;
         g_otherTouchCount = 0;
         g_contactBeginCount = 0;
