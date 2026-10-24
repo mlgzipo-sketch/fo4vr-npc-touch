@@ -314,9 +314,7 @@ namespace
             if (!g_hands || g_hands->getHandFrameV1(ownerToken, hand, &frame) != rock::api::Status::Ok) {
                 return false;
             }
-            constexpr auto required = static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid) |
-                                      static_cast<std::uint32_t>(hands::HandFrameFlagV1::HandWorldValid);
-            if ((frame.flags & required) != required) {
+            if ((frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) == 0) {
                 return false;
             }
             const auto now = Clock::now();
