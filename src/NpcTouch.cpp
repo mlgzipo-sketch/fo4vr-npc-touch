@@ -8,6 +8,7 @@
 #include <ROCK/Collision.h>
 #include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
+#include "NpcCollision.h"
 #include "Reactions.h"
 #include "Runtime.h"
 
@@ -526,6 +527,7 @@ namespace
                     char overlay[128]{};
                     std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> %s (%s)", handName(handIds[index]), actorName(hit.actor), hit.bone);
                     showOverlay(overlay);
+                    npctouch::collision::describeActor(hit.actor);
                     npctouch::reactions::onTouch(hit.actor, hit.bone, state.velocity);
                 } else if (state.touchedFormId != 0 && released) {
                     char message[160]{};
@@ -665,6 +667,7 @@ namespace
         static bool reactionsReady = false;
         if (!reactionsReady) {
             npctouch::reactions::initialize();
+            npctouch::collision::initialize();
             reactionsReady = true;
         }
         return true;
@@ -688,6 +691,9 @@ namespace
         pollFingerContacts(ownerToken, rock::api::Hand::Left);
         proximity::update(ownerToken);
         npctouch::reactions::update();
+        npctouch::collision::update(npctouch::runtime::hasLifecycleFlag(
+            snapshot.lifecycleFlags,
+            rock::api::core::LifecycleFlag::WorldAvailable));
         logSummary();
         publishOverlay(ownerToken, snapshot);
     }

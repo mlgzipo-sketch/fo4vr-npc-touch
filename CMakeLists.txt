@@ -36,6 +36,8 @@ endif()
 add_library(NpcTouch SHARED
   src/Runtime.cpp
   src/Runtime.h
+  src/NpcCollision.cpp
+  src/NpcCollision.h
   src/NpcTouch.cpp
   src/Reactions.cpp
   src/Reactions.h
