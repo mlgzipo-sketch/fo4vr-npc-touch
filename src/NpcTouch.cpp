@@ -1,4 +1,5 @@
 // NpcTouch, step 1: log every time the player's hands touch an NPC.
+// This build also logs non-NPC touches to diagnose what ROCK reports.
 //
 // ROCK owns hand physics. This plugin only reads ROCK's collision events and
 // contact snapshots, resolves the touched reference, and reports NPC touches
@@ -30,6 +31,7 @@ namespace
     std::uint64_t g_lastEventSequence{ 0 };
     std::uint64_t g_npcTouchCount{ 0 };
     std::uint64_t g_otherTouchCount{ 0 };
+    std::uint64_t g_contactBeginCount{ 0 };
     std::uint64_t g_lostEventCount{ 0 };
     Clock::time_point g_lastSummary{};
 
@@ -67,6 +69,40 @@ namespace
         return name && name[0] ? name : "<no name>";
     }
 
+    // Diagnostic description of any touched form: "[NPC_] 'Piper' 0001A4D7".
+    void describeForm(const std::uint32_t formId, char* out, const std::size_t size) noexcept
+    {
+        auto* form = formId ? RE::TESForm::GetFormByID(formId) : nullptr;
+        if (!form) {
+            std::snprintf(out, size, "form=%08X (unresolved)", formId);
+            return;
+        }
+        auto* ref = form->As<RE::TESObjectREFR>();
+        auto* base = ref ? ref->GetObjectReference() : nullptr;
+        const char* name = ref ? ref->GetDisplayFullName() : nullptr;
+        std::snprintf(
+            out,
+            size,
+            "form=%08X type=%s base=%s '%s'",
+            formId,
+            form->GetFormTypeString(),
+            base ? base->GetFormTypeString() : "-",
+            name && name[0] ? name : "");
+    }
+
+    // Caps diagnostic lines so touching a wall cannot flood the log.
+    bool allowDiagnosticLine() noexcept
+    {
+        static Clock::time_point windowStart{};
+        static int linesInWindow{ 0 };
+        const auto now = Clock::now();
+        if (now - windowStart >= std::chrono::seconds(1)) {
+            windowStart = now;
+            linesInWindow = 0;
+        }
+        return ++linesInWindow <= 20;
+    }
+
     void showOverlay(const char* text) noexcept
     {
         std::snprintf(g_overlayText, sizeof(g_overlayText), "%s", text);
@@ -80,6 +116,25 @@ namespace
         if (!npc) {
             if (begin) {
                 ++g_otherTouchCount;
+            }
+            if (allowDiagnosticLine()) {
+                char described[192]{};
+                describeForm(event.formId, described, sizeof(described));
+                char message[288]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "%s (not NPC): %s hand -> %s layer=%u",
+                    begin ? "touch begin" : "touch end",
+                    handName(event.hand),
+                    described,
+                    event.collisionLayer);
+                npctouch::runtime::logInfo(message);
+                if (begin) {
+                    char overlay[128]{};
+                    std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> object layer %u", handName(event.hand), event.collisionLayer);
+                    showOverlay(overlay);
+                }
             }
             return;
         }
@@ -161,8 +216,24 @@ namespace
             if (contact.contactState != collision::SemanticContactStateV1::Begin) {
                 continue;
             }
+            ++g_contactBeginCount;
             auto* npc = resolveNpc(contact.targetFormId);
             if (!npc) {
+                if (allowDiagnosticLine()) {
+                    char described[192]{};
+                    describeForm(contact.targetFormId, described, sizeof(described));
+                    char message[288]{};
+                    std::snprintf(
+                        message,
+                        sizeof(message),
+                        "  contact (not NPC): %s hand finger=%u role=%u targetBody=%u %s",
+                        handName(hand),
+                        contact.finger,
+                        contact.role,
+                        contact.targetBodyId,
+                        described);
+                    npctouch::runtime::logInfo(message);
+                }
                 continue;
             }
             char message[256]{};
@@ -190,19 +261,18 @@ namespace
             return;
         }
         g_lastSummary = now;
-        if (g_otherTouchCount == 0) {
-            return;
-        }
-        char message[160]{};
+        char message[192]{};
         std::snprintf(
             message,
             sizeof(message),
-            "Summary: NPC touches so far=%llu, non-NPC touch events in last %llds=%llu",
+            "Summary: NPC touches so far=%llu, in last %llds: non-NPC touch events=%llu, finger contact begins=%llu",
             static_cast<unsigned long long>(g_npcTouchCount),
             static_cast<long long>(kSummaryInterval.count()),
-            static_cast<unsigned long long>(g_otherTouchCount));
+            static_cast<unsigned long long>(g_otherTouchCount),
+            static_cast<unsigned long long>(g_contactBeginCount));
         npctouch::runtime::logInfo(message);
         g_otherTouchCount = 0;
+        g_contactBeginCount = 0;
     }
 
     void publishOverlay(

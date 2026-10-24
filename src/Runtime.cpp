@@ -131,9 +131,8 @@ namespace
         case F4SE::MessagingInterface::kNewGame:
             (void)connectRock();
             break;
-        case F4SE::MessagingInterface::kPreLoadGame:
-            disconnectRock();
-            break;
+        // The ROCK owner stays registered across save loads: ROCK rejects
+        // closing it from the load message, and frames keep flowing anyway.
         default:
             break;
         }
