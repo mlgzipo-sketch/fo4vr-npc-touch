@@ -58,7 +58,7 @@ namespace npctouch::reactions
             bool shoves{ true };
             float shoveSpeed{ 75.0f };
             // Faster still knocks the NPC over (ragdoll), if allowed.
-            bool knockdowns{ true };
+            bool knockdowns{ false };
             float knockdownSpeed{ 180.0f };
             float knockdownForce{ 1.0f };
         } g_settings{};
