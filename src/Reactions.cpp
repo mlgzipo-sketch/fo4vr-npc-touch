@@ -33,7 +33,7 @@ namespace npctouch::reactions
         struct Settings
         {
             bool enabled{ true };
-            bool allowCombat{ true };
+            bool allowCombat{ false };
             bool companionsSpeak{ true };
             float annoyanceForWarning{ 3.0f };
             float annoyanceForCombat{ 8.0f };
