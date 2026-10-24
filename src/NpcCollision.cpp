@@ -54,9 +54,9 @@ namespace npctouch::collision
         float g_radius{ 200.0f };
         // Body flags that differ between a standing NPC whose parts hands pass
         // through (00011486) and a sitting one they stop against (0007008E).
-        std::uint32_t g_clearFlags{ 0x1400 };
-        std::uint32_t g_setFlags{ 0x60000 };
-        bool g_activate{ true };
+        std::uint32_t g_clearFlags{ 0 };
+        std::uint32_t g_setFlags{ 0 };
+        bool g_activate{ false };
         std::uint32_t g_loggedFlagChanges{ 0 };
         bool g_faulted{ false };
         std::uint32_t g_frame{ 0 };
