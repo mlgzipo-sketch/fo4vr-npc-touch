@@ -3,6 +3,8 @@
 
 #include <F4SE/F4SE.h>
 #include <REL/Relocation.h>
+#include <REX/W32/OLE32.h>
+#include <REX/W32/SHELL32.h>
 #include <Windows.h>
 
 #include <cstdio>
@@ -25,14 +27,20 @@ namespace
 
     void initializeLogger()
     {
-        auto directory = F4SE::log::log_directory();
-        if (!directory) {
+        // F4SE::log::log_directory() needs F4SE::Init, which runs after Query,
+        // so before that it drops the "Fallout4VR" part of the path.
+        wchar_t* documents{ nullptr };
+        const auto result = REX::W32::SHGetKnownFolderPath(
+            REX::W32::FOLDERID_Documents, REX::W32::KF_FLAG_DEFAULT, nullptr, std::addressof(documents));
+        std::unique_ptr<wchar_t[], decltype(&REX::W32::CoTaskMemFree)> documentsPath(documents, REX::W32::CoTaskMemFree);
+        if (!documentsPath || result != 0) {
             return;
         }
+        auto directory = std::filesystem::path(documentsPath.get()) / "My Games" / "Fallout4VR" / "F4SE";
         const auto& example = npctouch::runtime::definition();
-        *directory /= std::string(example.pluginName) + ".log";
+        directory /= std::string(example.pluginName) + ".log";
         auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            directory->string(),
+            directory.string(),
             2 * 1024 * 1024,
             2,
             true);
