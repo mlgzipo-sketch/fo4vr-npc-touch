@@ -22,7 +22,9 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <random>
 #include <unordered_set>
+#include <vector>
 
 namespace npctouch::reactions
 {
@@ -40,10 +42,14 @@ namespace npctouch::reactions
             float annoyanceDecayPerMinute{ 4.0f };
             float speechCooldownSeconds{ 4.0f };
             float lookAtSeconds{ 3.0f };
-            // DialogueGeneric "Hit": short "Hey!" style lines for all common voices.
-            std::uint32_t lineTopic{ 0x000219CC };
-            // DialogueGenericCitizens "Pickpocket caught": "get your hands off me" style lines.
-            std::uint32_t warningTopic{ 0x000711BB };
+            // Topics a regular NPC picks from at random. DialogueGeneric "Hit":
+            // short "Hey!" lines for all common voices.
+            std::vector<std::uint32_t> lineTopics{ 0x000219CC };
+            // DialogueGenericCitizens "Pickpocket caught": "get your hands off me" lines.
+            std::vector<std::uint32_t> warningTopics{ 0x000711BB };
+            // Companion affinity from which chest/pelvis touches count as welcome
+            // (1000 is the game's "Idolizes" level). Romanced companions always do.
+            float closeAffinity{ 1000.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
@@ -52,21 +58,28 @@ namespace npctouch::reactions
         {
             std::uint32_t npcBase;
             std::uint32_t hitTopic;
+            std::uint32_t helloTopic;
         };
 
-        // Base NPC records and the "Hit" topic in each companion's COM quest.
+        // Base NPC records with the "Hit" and "Hello" topics of each companion's
+        // COM quest. The game picks Hello lines by affinity and romance itself.
         constexpr std::array kCompanions{
-            Companion{ 0x00002F1E, 0x00162C69 },  // Piper
-            Companion{ 0x000179FF, 0x000F0EB0 },  // Codsworth
-            Companion{ 0x00027683, 0x0010E26A },  // Danse
-            Companion{ 0x00002F24, 0x001576FF },  // Nick Valentine
-            Companion{ 0x00027686, 0x0010BA55 },  // Curie
-            Companion{ 0x00045AC9, 0x000F949F },  // Deacon
-            Companion{ 0x0002740E, 0x0011B648 },  // MacCready
-            Companion{ 0x00022613, 0x0012605C },  // Hancock
-            Companion{ 0x00079249, 0 },           // Cait
-            Companion{ 0x00027682, 0 },           // Strong
+            Companion{ 0x00002F1E, 0x00162C69, 0x00162C56 },  // Piper
+            Companion{ 0x000179FF, 0, 0x000F1248 },           // Codsworth
+            Companion{ 0x00027683, 0x0010E26A, 0x0010E271 },  // Danse
+            Companion{ 0x00002F24, 0x001576FF, 0x001576EC },  // Nick Valentine
+            Companion{ 0x00027686, 0x0010BA55, 0x0010BA40 },  // Curie
+            Companion{ 0x00045AC9, 0x000F949F, 0x000F7600 },  // Deacon
+            Companion{ 0x0002740E, 0x0011B648, 0x0011CD65 },  // MacCready
+            Companion{ 0x00022613, 0x0012605C, 0x00126092 },  // Hancock
+            Companion{ 0x00079249, 0x000F450B, 0x0007921C },  // Cait
+            Companion{ 0x00027682, 0, 0x0011F765 },           // Strong
+            Companion{ 0x00019FD9, 0, 0x0007925D },           // Preston Garvey
+            Companion{ 0x000BBEE6, 0x0012B8A7, 0x0011CE29 },  // X6-88
         };
+
+        constexpr std::uint32_t kAffinityValue = 0x000A1B80;  // CA_Affinity
+        constexpr std::uint32_t kRomanticValue = 0x00148DF6;  // CA_IsRomantic
 
         enum class Zone
         {
@@ -95,6 +108,26 @@ namespace npctouch::reactions
             const auto first = value.find_first_not_of(" \t\r\n");
             const auto last = value.find_last_not_of(" \t\r\n");
             return first == std::string::npos ? std::string{} : value.substr(first, last - first + 1);
+        }
+
+        // "000219CC, 000711BB" -> form IDs; zeros and junk are skipped.
+        std::vector<std::uint32_t> parseTopics(const std::string& value)
+        {
+            std::vector<std::uint32_t> topics;
+            const char* text = value.c_str();
+            while (*text) {
+                char* end{ nullptr };
+                const auto id = std::strtoul(text, &end, 16);
+                if (end == text) {
+                    ++text;
+                    continue;
+                }
+                if (id != 0) {
+                    topics.push_back(static_cast<std::uint32_t>(id));
+                }
+                text = end;
+            }
+            return topics;
         }
 
         void loadSettings() noexcept
@@ -135,10 +168,12 @@ namespace npctouch::reactions
                         g_settings.speechCooldownSeconds = number;
                     } else if (key == "fLookAtSeconds") {
                         g_settings.lookAtSeconds = number;
-                    } else if (key == "sLineTopic") {
-                        g_settings.lineTopic = static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 16));
-                    } else if (key == "sWarningTopic") {
-                        g_settings.warningTopic = static_cast<std::uint32_t>(std::strtoul(value.c_str(), nullptr, 16));
+                    } else if (key == "sLineTopics") {
+                        g_settings.lineTopics = parseTopics(value);
+                    } else if (key == "sWarningTopics") {
+                        g_settings.warningTopics = parseTopics(value);
+                    } else if (key == "fCloseAffinity") {
+                        g_settings.closeAffinity = number;
                     }
                 }
             } catch (...) {
@@ -149,7 +184,7 @@ namespace npctouch::reactions
             std::snprintf(
                 message,
                 sizeof(message),
-                "Reactions: enabled=%d combat=%d companionsSpeak=%d warning=%.1f combatAt=%.1f decay=%.1f/min cooldown=%.1fs line=%08X warningLine=%08X",
+                "Reactions: enabled=%d combat=%d companionsSpeak=%d warning=%.1f combatAt=%.1f decay=%.1f/min cooldown=%.1fs lines=%zu warningLines=%zu closeAffinity=%.0f",
                 g_settings.enabled,
                 g_settings.allowCombat,
                 g_settings.companionsSpeak,
@@ -157,8 +192,9 @@ namespace npctouch::reactions
                 g_settings.annoyanceForCombat,
                 g_settings.annoyanceDecayPerMinute,
                 g_settings.speechCooldownSeconds,
-                g_settings.lineTopic,
-                g_settings.warningTopic);
+                g_settings.lineTopics.size(),
+                g_settings.warningTopics.size(),
+                g_settings.closeAffinity);
             runtime::logInfo(message);
         }
 
@@ -398,6 +434,30 @@ namespace npctouch::reactions
             return nullptr;
         }
 
+        // Reads a game actor value such as CA_Affinity; 0 if it is unavailable.
+        float actorValue(RE::Actor* actor, const std::uint32_t valueId) noexcept
+        {
+            auto* info = RE::TESForm::GetFormByID<RE::ActorValueInfo>(valueId);
+            if (!actor || !info || g_brokenFunctions.contains("ActorValue")) {
+                return 0.0f;
+            }
+            float value{ 0.0f };
+            auto read = [&]() { value = static_cast<RE::ActorValueOwner*>(actor)->GetActorValue(*info); };
+            if (!guarded("ActorValue", "read", read)) {
+                return 0.0f;
+            }
+            return value;
+        }
+
+        std::uint32_t pickTopic(const std::vector<std::uint32_t>& topics) noexcept
+        {
+            if (topics.empty()) {
+                return 0;
+            }
+            static std::minstd_rand random{ static_cast<std::uint32_t>(Clock::now().time_since_epoch().count()) };
+            return topics[random() % topics.size()];
+        }
+
         Zone zoneOf(const char* bone) noexcept
         {
             if (!bone) {
@@ -493,15 +553,29 @@ namespace npctouch::reactions
                               std::chrono::milliseconds(static_cast<int>(g_settings.speechCooldownSeconds * 1000.0f));
         const char* action = "look";
         std::uint32_t spoken{ 0 };
+        float affinity{ 0.0f };
+        bool romantic{ false };
 
         if (friendly) {
-            // Companions are never angered by touches.
+            // Companions are never angered by touches. A friendly touch gets a
+            // hello; a chest/pelvis touch from someone they are not close to
+            // gets a startled "hit" line instead.
+            if (companion) {
+                affinity = actorValue(npc, kAffinityValue);
+                romantic = actorValue(npc, kRomanticValue) > 0.0f;
+            }
+            const bool close = romantic || affinity >= g_settings.closeAffinity;
             if (g_settings.companionsSpeak && canSpeak) {
-                const auto topic = companion && companion->hitTopic ? companion->hitTopic : g_settings.lineTopic;
-                if (say(npc, topic)) {
+                std::uint32_t topic{ 0 };
+                if (companion) {
+                    topic = zone == Zone::Intimate && !close && companion->hitTopic ? companion->hitTopic : companion->helloTopic;
+                } else {
+                    topic = pickTopic(g_settings.lineTopics);
+                }
+                if (topic && say(npc, topic)) {
                     state.lastSpeech = now;
                     spoken = topic;
-                    action = "companion line";
+                    action = companion && topic == companion->helloTopic ? "companion hello" : "companion line";
                 }
             }
         } else {
@@ -511,10 +585,14 @@ namespace npctouch::reactions
                     state.fighting = true;
                     action = "start combat";
                 }
-            } else if (canSpeak || (!state.warned && state.annoyance >= g_settings.annoyanceForWarning)) {
+            } else if (canSpeak || (!state.warned && state.annoyance >= g_settings.annoyanceForWarning &&
+                                       now - state.lastSpeech >= std::chrono::milliseconds(1500))) {
                 const bool warning = state.annoyance >= g_settings.annoyanceForWarning;
-                const auto topic = warning && g_settings.warningTopic ? g_settings.warningTopic : g_settings.lineTopic;
-                if (say(npc, topic)) {
+                auto topic = warning ? pickTopic(g_settings.warningTopics) : 0;
+                if (!topic) {
+                    topic = pickTopic(g_settings.lineTopics);
+                }
+                if (topic && say(npc, topic)) {
                     state.lastSpeech = now;
                     spoken = topic;
                     action = warning ? "warning line" : "line";
@@ -527,11 +605,13 @@ namespace npctouch::reactions
         std::snprintf(
             message,
             sizeof(message),
-            "REACTION: '%s' %s zone=%s annoyance=%.1f -> %s topic=%08X",
+            "REACTION: '%s' %s zone=%s annoyance=%.1f affinity=%.0f romantic=%d -> %s topic=%08X",
             actorName(npc),
             friendly ? "companion" : "npc",
             zoneName(zone),
             state.annoyance,
+            affinity,
+            romantic,
             action,
             spoken);
         runtime::logInfo(message);
