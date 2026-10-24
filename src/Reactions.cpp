@@ -42,11 +42,14 @@ namespace npctouch::reactions
             float annoyanceDecayPerMinute{ 4.0f };
             float speechCooldownSeconds{ 4.0f };
             float lookAtSeconds{ 3.0f };
-            // Topics a regular NPC picks from at random. DialogueGeneric "Hit":
-            // short "Hey!" lines for all common voices.
-            std::vector<std::uint32_t> lineTopics{ 0x000219CC };
-            // DialogueGenericCitizens "Pickpocket caught": "get your hands off me" lines.
-            std::vector<std::uint32_t> warningTopics{ 0x000711BB };
+            // Topics a regular NPC picks from at random, all voiced by the
+            // common voices: DialogueGeneric "Normal to alert" ("Хм?", "Что?",
+            // "Чего?", "Эй..."), DialogueGenericCitizens "Hello" ("А?", "Да?")
+            // and DialogueGeneric "Hit" ("Уф!", "А!").
+            std::vector<std::uint32_t> lineTopics{ 0x0003D77F, 0x000D101E, 0x000219CC };
+            // DialogueGenericCitizens "Accused you" ("Больше так не делай.") and
+            // "Pickpocket caught" ("Я все вижу!", "Чертовы карманники!").
+            std::vector<std::uint32_t> warningTopics{ 0x000D14A6, 0x000711BB };
             // Companion affinity from which chest/pelvis touches count as welcome
             // (1000 is the game's "Idolizes" level). Romanced companions always do.
             float closeAffinity{ 1000.0f };
