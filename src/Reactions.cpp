@@ -321,14 +321,31 @@ namespace npctouch::reactions
             if (ok) {
                 return object;
             }
-            auto create = [&]() { ok = vm->CreateObject(typeInfo->name, object) && object; };
-            if (!guarded("TopicObject", "create", create) || !ok) {
+            // IVirtualMachine::CreateObject has two overloads, and MSVC puts
+            // overloaded virtuals in the opposite slot order, so that call
+            // landed on the wrong game function and faulted. The bind
+            // interface has a single create function, which is what the
+            // engine itself uses before binding.
+            auto* internal = static_cast<RE::BSScript::Internal::VirtualMachine*>(vm);
+            auto* binder = static_cast<RE::BSScript::IVMObjectBindInterface*>(internal);
+            auto create = [&]() { ok = binder->CreateObjectWithProperties(typeInfo->name, 0, object) && object; };
+            if (g_brokenFunctions.contains("TopicCreate") || !guarded("TopicCreate", "create with properties", create)) {
+                // Last resort: call the no-properties CreateObject by its game slot.
+                using CreateFn = bool (*)(RE::BSScript::IVirtualMachine*, const RE::BSFixedString&, RE::BSTSmartPointer<RE::BSScript::Object>&);
+                auto createBySlot = [&]() {
+                    auto** table = *reinterpret_cast<void***>(vm);
+                    ok = reinterpret_cast<CreateFn>(table[0x17])(vm, typeInfo->name, object) && object;
+                };
+                if (!guarded("TopicObject", "create by slot 0x17", createBySlot)) {
+                    return nullptr;
+                }
+            }
+            if (!ok) {
+                runtime::logWarning("Papyrus could not create a script object for the topic");
+                g_brokenFunctions.insert("TopicObject");
                 return nullptr;
             }
-            auto bind = [&]() {
-                auto* internal = static_cast<RE::BSScript::Internal::VirtualMachine*>(vm);
-                static_cast<RE::BSScript::IVMObjectBindInterface*>(internal)->BindObject(object, handle, false);
-            };
+            auto bind = [&]() { binder->BindObject(object, handle, false); };
             if (!guarded("TopicObject", "bind", bind)) {
                 return nullptr;
             }
