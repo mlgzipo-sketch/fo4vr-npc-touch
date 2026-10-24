@@ -27,6 +27,12 @@ add_subdirectory("${COMMON_LIB_F4VR_PATH}" "CommonLibF4" EXCLUDE_FROM_ALL)
 
 find_package(spdlog CONFIG REQUIRED)
 
+if(DEFINED ENV{GITHUB_SHA})
+  string(SUBSTRING "$ENV{GITHUB_SHA}" 0 7 NPCTOUCH_BUILD)
+else()
+  set(NPCTOUCH_BUILD "local")
+endif()
+
 add_library(NpcTouch SHARED
   src/Runtime.cpp
   src/Runtime.h
@@ -40,6 +46,7 @@ target_compile_definitions(NpcTouch PRIVATE
   NOMINMAX
   NOMMNOSOUND
   NPCTOUCH_VERSION=1
+  NPCTOUCH_BUILD="${NPCTOUCH_BUILD}"
 )
 target_include_directories(NpcTouch PRIVATE
   "${RPS_SDK_ROOT}/SDK/ROCK/include"

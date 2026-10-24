@@ -36,6 +36,21 @@ namespace
     std::uint64_t g_npcTouchCount{ 0 };
     std::uint64_t g_otherTouchCount{ 0 };
     std::uint64_t g_contactBeginCount{ 0 };
+
+    // Last status of each ROCK read, reported in the summary for diagnosis.
+    struct Diagnostics
+    {
+        std::uint32_t eventsStatus{ 0xFFFFFFFF };
+        std::uint32_t contactsStatus{ 0xFFFFFFFF };
+        std::uint32_t contactsSeen{ 0 };
+        std::uint32_t handStatus{ 0xFFFFFFFF };
+        std::uint32_t handFlags{ 0 };
+        float handPosition[3]{};
+        std::uint32_t nearbyActors{ 0 };
+        float nearestGap{ -1.0f };
+        char nearestBone[32]{};
+        char nearestName[48]{};
+    } g_diag{};
     std::uint64_t g_lostEventCount{ 0 };
     Clock::time_point g_lastSummary{};
 
@@ -170,12 +185,14 @@ namespace
         for (int batch = 0; batch < 4; ++batch) {
             std::array<collision::EventV1, 32> events{};
             rock::api::StreamV1 stream{};
-            if (g_collision->copyEvents(
-                    ownerToken,
-                    g_lastEventSequence,
-                    events.data(),
-                    static_cast<std::uint32_t>(events.size()),
-                    &stream) != rock::api::Status::Ok) {
+            const auto status = g_collision->copyEvents(
+                ownerToken,
+                g_lastEventSequence,
+                events.data(),
+                static_cast<std::uint32_t>(events.size()),
+                &stream);
+            g_diag.eventsStatus = static_cast<std::uint32_t>(status);
+            if (status != rock::api::Status::Ok) {
                 return;
             }
             if (stream.lostCount > g_lostEventCount) {
@@ -205,15 +222,18 @@ namespace
     {
         std::array<collision::SemanticHandContactV1, 20> contacts{};
         std::uint32_t contactCount{ 0 };
-        if (g_collision->copySemanticHandContactsV1(
-                ownerToken,
-                hand,
-                0,
-                contacts.data(),
-                static_cast<std::uint32_t>(contacts.size()),
-                &contactCount) != rock::api::Status::Ok) {
+        const auto status = g_collision->copySemanticHandContactsV1(
+            ownerToken,
+            hand,
+            0,
+            contacts.data(),
+            static_cast<std::uint32_t>(contacts.size()),
+            &contactCount);
+        g_diag.contactsStatus = static_cast<std::uint32_t>(status);
+        if (status != rock::api::Status::Ok) {
             return;
         }
+        g_diag.contactsSeen += contactCount;
 
         for (std::uint32_t index = 0; index < contactCount && index < contacts.size(); ++index) {
             const auto& contact = contacts[index];
@@ -311,7 +331,18 @@ namespace
         bool readHand(const std::uint64_t ownerToken, const rock::api::Hand hand, HandState& state) noexcept
         {
             hands::HandFrameV1 frame{};
-            if (!g_hands || g_hands->getHandFrameV1(ownerToken, hand, &frame) != rock::api::Status::Ok) {
+            if (!g_hands) {
+                return false;
+            }
+            const auto status = g_hands->getHandFrameV1(ownerToken, hand, &frame);
+            if (hand == rock::api::Hand::Right) {
+                g_diag.handStatus = static_cast<std::uint32_t>(status);
+                g_diag.handFlags = frame.flags;
+                for (int axis = 0; axis < 3; ++axis) {
+                    g_diag.handPosition[axis] = frame.transform.translate[axis];
+                }
+            }
+            if (status != rock::api::Status::Ok) {
                 return false;
             }
             if ((frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) == 0) {
@@ -352,6 +383,7 @@ namespace
                 if (!actor || actor == player || distance(actor->GetPosition(), player->GetPosition()) > kSearchRadius) {
                     continue;
                 }
+                ++g_diag.nearbyActors;
                 auto* root = actor->Get3D();
                 if (!root) {
                     continue;
@@ -387,7 +419,13 @@ namespace
                 if (!readHand(ownerToken, handIds[index], state)) {
                     continue;
                 }
+                g_diag.nearbyActors = 0;
                 const auto hit = nearestBone(state.position, player);
+                if (index == 0) {
+                    g_diag.nearestGap = hit.actor ? hit.gap : -1.0f;
+                    std::snprintf(g_diag.nearestBone, sizeof(g_diag.nearestBone), "%s", hit.bone ? hit.bone : "-");
+                    std::snprintf(g_diag.nearestName, sizeof(g_diag.nearestName), "%s", hit.actor ? actorName(hit.actor) : "-");
+                }
                 const bool inside = hit.actor && hit.gap <= 0.0f;
                 const bool released = !hit.actor || hit.gap > kReleaseMargin ||
                                       (state.touchedFormId != 0 && hit.actor->GetFormID() != state.touchedFormId);
@@ -444,6 +482,26 @@ namespace
             static_cast<unsigned long long>(g_otherTouchCount),
             static_cast<unsigned long long>(g_contactBeginCount));
         npctouch::runtime::logInfo(message);
+        char detail[384]{};
+        std::snprintf(
+            detail,
+            sizeof(detail),
+            "  status: events=%u contacts=%u (seen %u) hands=%s handFrame=%u flags=%X rightHand=(%.0f, %.0f, %.0f) nearbyNPCs=%u nearest='%s' bone=%s gap=%.0f",
+            g_diag.eventsStatus,
+            g_diag.contactsStatus,
+            g_diag.contactsSeen,
+            g_hands ? "yes" : "no",
+            g_diag.handStatus,
+            g_diag.handFlags,
+            g_diag.handPosition[0],
+            g_diag.handPosition[1],
+            g_diag.handPosition[2],
+            g_diag.nearbyActors,
+            g_diag.nearestName,
+            g_diag.nearestBone,
+            g_diag.nearestGap);
+        npctouch::runtime::logInfo(detail);
+        g_diag.contactsSeen = 0;
         g_otherTouchCount = 0;
         g_contactBeginCount = 0;
     }
@@ -500,7 +558,7 @@ namespace
         g_otherTouchCount = 0;
         g_lastSummary = Clock::now();
         g_overlayUntil = {};
-        npctouch::runtime::logInfo("Listening for hand touches on NPCs");
+        npctouch::runtime::logInfo("Listening for hand touches on NPCs (build " NPCTOUCH_BUILD ")");
         return true;
     }
 
