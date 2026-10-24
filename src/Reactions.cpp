@@ -287,16 +287,57 @@ namespace npctouch::reactions
             return dispatched;
         }
 
+        // Topics have no script attached, so packing one makes the library
+        // create and bind a new script object through ObjectBindPolicy, which
+        // faulted in VR. Bind it through the VM's virtual bind interface
+        // instead, the same path the game uses.
+        RE::BSTSmartPointer<RE::BSScript::Object> topicObject(RE::TESTopic* topic) noexcept
+        {
+            RE::BSTSmartPointer<RE::BSScript::Object> object;
+            auto* vm = virtualMachine();
+            if (!vm || !topic || g_brokenFunctions.contains("TopicObject")) {
+                return object;
+            }
+            auto bind = [&]() {
+                constexpr auto type = static_cast<std::uint32_t>(RE::TESTopic::FORM_ID);
+                RE::BSTSmartPointer<RE::BSScript::ObjectTypeInfo> typeInfo;
+                if (!vm->GetScriptObjectType(type, typeInfo) || !typeInfo) {
+                    return;
+                }
+                const auto& policy = vm->GetObjectHandlePolicy();
+                const auto handle = policy.GetHandleForObject(type, topic);
+                if (handle == policy.EmptyHandle()) {
+                    return;
+                }
+                if (vm->FindBoundObject(handle, typeInfo->name.c_str(), false, object, false) && object) {
+                    return;
+                }
+                if (!vm->CreateObject(typeInfo->name, object) || !object) {
+                    return;
+                }
+                auto* internal = static_cast<RE::BSScript::Internal::VirtualMachine*>(vm);
+                static_cast<RE::BSScript::IVMObjectBindInterface*>(internal)->BindObject(object, handle, false);
+            };
+            if (!guarded("TopicObject", "bind topic", bind)) {
+                object = nullptr;
+            }
+            return object;
+        }
+
         bool say(RE::Actor* actor, const std::uint32_t topicId) noexcept
         {
             auto* topic = RE::TESForm::GetFormByID<RE::TESTopic>(topicId);
             if (!topic) {
                 return false;
             }
+            auto object = topicObject(topic);
+            if (!object) {
+                return false;
+            }
             return callActor(
                 actor,
                 "Say",
-                topic,
+                object,
                 static_cast<RE::Actor*>(nullptr),
                 false,
                 static_cast<RE::TESObjectREFR*>(RE::PlayerCharacter::GetSingleton()));
