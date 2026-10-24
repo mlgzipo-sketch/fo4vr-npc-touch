@@ -37,6 +37,8 @@ add_library(NpcTouch SHARED
   src/Runtime.cpp
   src/Runtime.h
   src/NpcTouch.cpp
+  src/Reactions.cpp
+  src/Reactions.h
 )
 target_compile_features(NpcTouch PRIVATE cxx_std_23)
 target_compile_definitions(NpcTouch PRIVATE

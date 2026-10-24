@@ -8,6 +8,7 @@
 #include <ROCK/Collision.h>
 #include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
+#include "Reactions.h"
 #include "Runtime.h"
 
 #include <RE/Fallout.h>
@@ -516,6 +517,7 @@ namespace
                     char overlay[128]{};
                     std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> %s (%s)", handName(handIds[index]), actorName(hit.actor), hit.bone);
                     showOverlay(overlay);
+                    npctouch::reactions::onTouch(hit.actor, hit.bone);
                 } else if (state.touchedFormId != 0 && released) {
                     char message[160]{};
                     std::snprintf(
@@ -651,6 +653,11 @@ namespace
         g_lastSummary = Clock::now();
         g_overlayUntil = {};
         npctouch::runtime::logInfo("Listening for hand touches on NPCs (build " NPCTOUCH_BUILD ")");
+        static bool reactionsReady = false;
+        if (!reactionsReady) {
+            npctouch::reactions::initialize();
+            reactionsReady = true;
+        }
         return true;
     }
 
@@ -671,6 +678,7 @@ namespace
         pollFingerContacts(ownerToken, rock::api::Hand::Right);
         pollFingerContacts(ownerToken, rock::api::Hand::Left);
         proximity::update(ownerToken);
+        npctouch::reactions::update();
         logSummary();
         publishOverlay(ownerToken, snapshot);
     }

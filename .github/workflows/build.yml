@@ -49,6 +49,7 @@ jobs:
           $plugins = "package\F4SE\Plugins"
           New-Item -ItemType Directory -Force $plugins | Out-Null
           Copy-Item build\Release\NpcTouch.dll $plugins
+          Copy-Item NpcTouch.ini $plugins
 
       - name: Upload mod
         uses: actions/upload-artifact@v4
