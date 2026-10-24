@@ -45,13 +45,17 @@ namespace
         std::uint32_t eventsStatus{ 0xFFFFFFFF };
         std::uint32_t contactsStatus{ 0xFFFFFFFF };
         std::uint32_t contactsSeen{ 0 };
-        std::uint32_t handStatus{ 0xFFFFFFFF };
-        std::uint32_t handFlags{ 0 };
-        float handPosition[3]{};
+        struct Hand
+        {
+            std::uint32_t status{ 0xFFFFFFFF };
+            std::uint32_t flags{ 0 };
+            float position[3]{};
+            // Closest approach to any NPC since the last summary.
+            float minGap{ -1.0f };
+            char minBone[32]{};
+            char minName[48]{};
+        } hand[2]{};
         std::uint32_t nearbyActors{ 0 };
-        float nearestGap{ -1.0f };
-        char nearestBone[32]{};
-        char nearestName[48]{};
         float actorPosition[3]{};
         float bonePosition[3]{};
         bool usedCapsule{ false };
@@ -127,10 +131,13 @@ namespace
         return ++linesInWindow <= 20;
     }
 
+    // ROCK's debug overlay only draws when ROCK's own debug view is on, so
+    // also post the text as a regular game notification in the corner.
     void showOverlay(const char* text) noexcept
     {
         std::snprintf(g_overlayText, sizeof(g_overlayText), "%s", text);
         g_overlayUntil = Clock::now() + kOverlayDuration;
+        RE::SendHUDMessage::ShowHUDMessage(g_overlayText, nullptr, false, false);
     }
 
     void handleTouchEvent(const collision::EventV1& event) noexcept
@@ -310,6 +317,8 @@ namespace
         };
 
         constexpr float kSearchRadius = 250.0f;
+        // ROCK's hand frame sits at the wrist; the palm and fingers reach further.
+        constexpr float kHandReach = 6.0f;
         constexpr float kReleaseMargin = 4.0f;
 
         struct HandState
@@ -340,12 +349,11 @@ namespace
                 return false;
             }
             const auto status = g_hands->getHandFrameV1(ownerToken, hand, &frame);
-            if (hand == rock::api::Hand::Right) {
-                g_diag.handStatus = static_cast<std::uint32_t>(status);
-                g_diag.handFlags = frame.flags;
-                for (int axis = 0; axis < 3; ++axis) {
-                    g_diag.handPosition[axis] = frame.transform.translate[axis];
-                }
+            auto& diag = g_diag.hand[hand == rock::api::Hand::Right ? 0 : 1];
+            diag.status = static_cast<std::uint32_t>(status);
+            diag.flags = frame.flags;
+            for (int axis = 0; axis < 3; ++axis) {
+                diag.position[axis] = frame.transform.translate[axis];
             }
             if (status != rock::api::Status::Ok) {
                 return false;
@@ -480,13 +488,14 @@ namespace
                 }
                 g_diag.nearbyActors = 0;
                 const auto hit = nearestBone(state.position, player);
-                if (index == 0) {
-                    g_diag.nearestGap = hit.actor ? hit.gap : -1.0f;
-                    std::snprintf(g_diag.nearestBone, sizeof(g_diag.nearestBone), "%s", hit.bone ? hit.bone : "-");
-                    std::snprintf(g_diag.nearestName, sizeof(g_diag.nearestName), "%s", hit.actor ? actorName(hit.actor) : "-");
+                auto& diag = g_diag.hand[index];
+                if (hit.actor && (diag.minGap < 0.0f || hit.gap < diag.minGap)) {
+                    diag.minGap = std::max(hit.gap, 0.0f);
+                    std::snprintf(diag.minBone, sizeof(diag.minBone), "%s", hit.bone);
+                    std::snprintf(diag.minName, sizeof(diag.minName), "%s", actorName(hit.actor));
                 }
-                const bool inside = hit.actor && hit.gap <= 0.0f;
-                const bool released = !hit.actor || hit.gap > kReleaseMargin ||
+                const bool inside = hit.actor && hit.gap <= kHandReach;
+                const bool released = !hit.actor || hit.gap > kHandReach + kReleaseMargin ||
                                       (state.touchedFormId != 0 && hit.actor->GetFormID() != state.touchedFormId);
 
                 if (state.touchedFormId == 0 && inside) {
@@ -541,25 +550,36 @@ namespace
             static_cast<unsigned long long>(g_otherTouchCount),
             static_cast<unsigned long long>(g_contactBeginCount));
         npctouch::runtime::logInfo(message);
-        char detail[384]{};
+        char detail[256]{};
         std::snprintf(
             detail,
             sizeof(detail),
-            "  status: events=%u contacts=%u (seen %u) hands=%s handFrame=%u flags=%X rightHand=(%.0f, %.0f, %.0f) nearbyNPCs=%u nearest='%s' bone=%s gap=%.0f",
+            "  status: events=%u contacts=%u (seen %u) hands=%s nearbyNPCs=%u",
             g_diag.eventsStatus,
             g_diag.contactsStatus,
             g_diag.contactsSeen,
             g_hands ? "yes" : "no",
-            g_diag.handStatus,
-            g_diag.handFlags,
-            g_diag.handPosition[0],
-            g_diag.handPosition[1],
-            g_diag.handPosition[2],
-            g_diag.nearbyActors,
-            g_diag.nearestName,
-            g_diag.nearestBone,
-            g_diag.nearestGap);
+            g_diag.nearbyActors);
         npctouch::runtime::logInfo(detail);
+        for (int index = 0; index < 2; ++index) {
+            auto& diag = g_diag.hand[index];
+            char line[256]{};
+            std::snprintf(
+                line,
+                sizeof(line),
+                "  %s hand: frame=%u flags=%X at (%.0f, %.0f, %.0f) closest='%s' bone=%s gap=%.0f",
+                index == 0 ? "right" : "left",
+                diag.status,
+                diag.flags,
+                diag.position[0],
+                diag.position[1],
+                diag.position[2],
+                diag.minGap < 0.0f ? "-" : diag.minName,
+                diag.minGap < 0.0f ? "-" : diag.minBone,
+                diag.minGap);
+            npctouch::runtime::logInfo(line);
+            diag.minGap = -1.0f;
+        }
         char where[256]{};
         std::snprintf(
             where,
