@@ -1,0 +1,6 @@
+[submodule "extern/RPS_SDK"]
+	path = extern/RPS_SDK
+	url = https://github.com/brunocatani/RPS_SDK
+[submodule "extern/CommonLibF4VR"]
+	path = extern/CommonLibF4VR
+	url = https://github.com/ArthurHub/CommonLibF4VR
