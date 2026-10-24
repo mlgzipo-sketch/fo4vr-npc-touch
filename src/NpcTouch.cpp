@@ -7,11 +7,13 @@
 
 #include <ROCK/Collision.h>
 #include <ROCK/Diagnostics.h>
+#include <ROCK/Hands.h>
 #include "Runtime.h"
 
 #include <RE/Fallout.h>
 
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 
@@ -21,12 +23,14 @@ namespace
     using npctouch::runtime::hasLifecycleFlag;
     namespace collision = rock::api::collision;
     namespace diagnostics = rock::api::diagnostics;
+    namespace hands = rock::api::hands;
 
     constexpr auto kOverlayDuration = std::chrono::seconds(3);
     constexpr auto kSummaryInterval = std::chrono::seconds(10);
 
     const collision::ApiV1* g_collision{};
     const diagnostics::ApiV1* g_diagnostics{};
+    const hands::ApiV1* g_hands{};
 
     std::uint64_t g_lastEventSequence{ 0 };
     std::uint64_t g_npcTouchCount{ 0 };
@@ -254,6 +258,177 @@ namespace
         }
     }
 
+
+    // Fallback detector that does not depend on ROCK contact events: compare
+    // each hand's position with a few bones of every nearby NPC.
+    namespace proximity
+    {
+        struct Bone
+        {
+            const char* name;
+            float radius;  // game units; roughly half the limb thickness plus palm
+        };
+
+        constexpr std::array kBones{
+            Bone{ "Head", 13.0f },
+            Bone{ "Neck", 9.0f },
+            Bone{ "Chest", 15.0f },
+            Bone{ "SPINE2", 14.0f },
+            Bone{ "SPINE1", 14.0f },
+            Bone{ "Pelvis", 14.0f },
+            Bone{ "LArm_UpperArm", 8.0f },
+            Bone{ "RArm_UpperArm", 8.0f },
+            Bone{ "LArm_ForeArm1", 7.0f },
+            Bone{ "RArm_ForeArm1", 7.0f },
+            Bone{ "LArm_Hand", 7.0f },
+            Bone{ "RArm_Hand", 7.0f },
+        };
+
+        constexpr float kSearchRadius = 250.0f;
+        constexpr float kReleaseMargin = 4.0f;
+
+        struct HandState
+        {
+            bool valid{ false };
+            RE::NiPoint3 position{};
+            RE::NiPoint3 previous{};
+            Clock::time_point previousTime{};
+            float speed{ 0.0f };
+            std::uint32_t touchedFormId{ 0 };
+            const char* touchedBone{ nullptr };
+        };
+
+        std::array<HandState, 2> g_handStates{};
+
+        float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+        {
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float dz = a.z - b.z;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        bool readHand(const std::uint64_t ownerToken, const rock::api::Hand hand, HandState& state) noexcept
+        {
+            hands::HandFrameV1 frame{};
+            if (!g_hands || g_hands->getHandFrameV1(ownerToken, hand, &frame) != rock::api::Status::Ok) {
+                return false;
+            }
+            constexpr auto required = static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid) |
+                                      static_cast<std::uint32_t>(hands::HandFrameFlagV1::HandWorldValid);
+            if ((frame.flags & required) != required) {
+                return false;
+            }
+            const auto now = Clock::now();
+            const RE::NiPoint3 position{ frame.transform.translate[0], frame.transform.translate[1], frame.transform.translate[2] };
+            if (state.valid) {
+                const float seconds = std::chrono::duration<float>(now - state.previousTime).count();
+                if (seconds > 0.0f) {
+                    state.speed = distance(position, state.position) / seconds;
+                }
+            }
+            state.previous = state.position;
+            state.position = position;
+            state.previousTime = now;
+            state.valid = true;
+            return true;
+        }
+
+        struct Hit
+        {
+            RE::Actor* actor{ nullptr };
+            const char* bone{ nullptr };
+            float gap{ 0.0f };  // distance minus bone radius; negative means inside
+        };
+
+        Hit nearestBone(const RE::NiPoint3& hand, RE::Actor* player) noexcept
+        {
+            Hit best{};
+            auto* lists = RE::ProcessLists::GetSingleton();
+            if (!lists || !player) {
+                return best;
+            }
+            for (const auto& handle : lists->highActorHandles) {
+                auto actorPtr = handle.get();
+                auto* actor = actorPtr.get();
+                if (!actor || actor == player || distance(actor->GetPosition(), player->GetPosition()) > kSearchRadius) {
+                    continue;
+                }
+                auto* root = actor->Get3D();
+                if (!root) {
+                    continue;
+                }
+                for (const auto& bone : kBones) {
+                    static std::array<RE::BSFixedString, kBones.size()> names{};
+                    const auto index = static_cast<std::size_t>(&bone - kBones.data());
+                    if (names[index].empty()) {
+                        names[index] = bone.name;
+                    }
+                    auto* node = root->GetObjectByName(names[index]);
+                    if (!node) {
+                        continue;
+                    }
+                    const float gap = distance(hand, node->world.translate) - bone.radius;
+                    if (!best.actor || gap < best.gap) {
+                        best = Hit{ actor, bone.name, gap };
+                    }
+                }
+            }
+            return best;
+        }
+
+        void update(const std::uint64_t ownerToken) noexcept
+        {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!g_hands || !player) {
+                return;
+            }
+            constexpr std::array handIds{ rock::api::Hand::Right, rock::api::Hand::Left };
+            for (std::size_t index = 0; index < handIds.size(); ++index) {
+                auto& state = g_handStates[index];
+                if (!readHand(ownerToken, handIds[index], state)) {
+                    continue;
+                }
+                const auto hit = nearestBone(state.position, player);
+                const bool inside = hit.actor && hit.gap <= 0.0f;
+                const bool released = !hit.actor || hit.gap > kReleaseMargin ||
+                                      (state.touchedFormId != 0 && hit.actor->GetFormID() != state.touchedFormId);
+
+                if (state.touchedFormId == 0 && inside) {
+                    state.touchedFormId = hit.actor->GetFormID();
+                    state.touchedBone = hit.bone;
+                    ++g_npcTouchCount;
+                    char message[256]{};
+                    std::snprintf(
+                        message,
+                        sizeof(message),
+                        "PROXIMITY TOUCH BEGIN: %s hand -> NPC '%s' form=%08X bone=%s handSpeed=%.0f u/s",
+                        handName(handIds[index]),
+                        actorName(hit.actor),
+                        state.touchedFormId,
+                        hit.bone,
+                        state.speed);
+                    npctouch::runtime::logInfo(message);
+                    char overlay[128]{};
+                    std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> %s (%s)", handName(handIds[index]), actorName(hit.actor), hit.bone);
+                    showOverlay(overlay);
+                } else if (state.touchedFormId != 0 && released) {
+                    char message[160]{};
+                    std::snprintf(
+                        message,
+                        sizeof(message),
+                        "PROXIMITY TOUCH END: %s hand left form=%08X bone=%s",
+                        handName(handIds[index]),
+                        state.touchedFormId,
+                        state.touchedBone ? state.touchedBone : "?");
+                    npctouch::runtime::logInfo(message);
+                    state.touchedFormId = 0;
+                    state.touchedBone = nullptr;
+                }
+            }
+        }
+    }
+
     void logSummary() noexcept
     {
         const auto now = Clock::now();
@@ -312,6 +487,11 @@ namespace
             g_diagnostics = nullptr;
             npctouch::runtime::logWarning("ROCK diagnostics overlay unavailable; logging only");
         }
+        // Hands feeds the proximity fallback; without it only ROCK contacts are used.
+        if (client.acquire(static_cast<std::uint32_t>(hands::PermissionV1::Read), g_hands) != rock::api::Status::Ok) {
+            g_hands = nullptr;
+            npctouch::runtime::logWarning("ROCK hands interface unavailable; proximity touch detection disabled");
+        }
         return true;
     }
 
@@ -342,6 +522,7 @@ namespace
         pollTouchEvents(ownerToken);
         pollFingerContacts(ownerToken, rock::api::Hand::Right);
         pollFingerContacts(ownerToken, rock::api::Hand::Left);
+        proximity::update(ownerToken);
         logSummary();
         publishOverlay(ownerToken, snapshot);
     }
