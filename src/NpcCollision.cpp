@@ -5,7 +5,8 @@
 // NPCs keep their body parts on BIPED (8), so hands pass through them. ROCK
 // re-applies its layer matrix every frame, so instead of changing the matrix
 // this moves the body parts of NPCs near the player from 8 to 33, and back
-// once they are far away. Offsets come from ROCK 0.9 (HavokOffsets.h) for
+// once they are far away. Standing NPCs also carry body flags that sitting
+// ones do not, so the configured flags are cleared too. Offsets come from ROCK 0.9 (HavokOffsets.h) for
 // Fallout 4 VR 1.2.72.
 
 #include "NpcCollision.h"
@@ -44,9 +45,19 @@ namespace npctouch::collision
         constexpr std::uintptr_t kBodyFilterInfo = 0x44;
         constexpr std::uintptr_t kBodyId = 0x60;
         constexpr std::uint32_t kInvalidBodyId = 0x7FFF'FFFF;
+        constexpr std::uintptr_t kBodyFlags = 0x40;
+        constexpr std::uintptr_t kEnableBodyFlags = 0x153C090;
+        constexpr std::uintptr_t kDisableBodyFlags = 0x153C150;
+        constexpr std::uintptr_t kActivateBody = 0x1546EF0;
 
         bool g_enabled{ true };
         float g_radius{ 200.0f };
+        // Body flags that differ between a standing NPC whose parts hands pass
+        // through (00011486) and a sitting one they stop against (0007008E).
+        std::uint32_t g_clearFlags{ 0x1000 };
+        std::uint32_t g_setFlags{ 0 };
+        bool g_activate{ true };
+        std::uint32_t g_loggedFlagChanges{ 0 };
         bool g_faulted{ false };
         std::uint32_t g_frame{ 0 };
         std::uint32_t g_loggedSwitches{ 0 };
@@ -112,7 +123,7 @@ namespace npctouch::collision
         {
             __try {
                 auto* bodies = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(body.world) + kWorldBodyArray);
-                flags = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + 0x40);
+                flags = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + kBodyFlags);
                 motion = *reinterpret_cast<std::uint32_t*>(bodies + body.id * kBodyStride + 0x68);
                 return true;
             } __except (1) {
@@ -127,6 +138,29 @@ namespace npctouch::collision
             __try {
                 const auto function = reinterpret_cast<SetFilterInfo>(REL::Module::get().base() + kSetBodyCollisionFilterInfo);
                 function(body.world, body.id, info, 0);
+                return true;
+            } __except (1) {
+                return false;
+            }
+        }
+
+        using ChangeBodyFlags = void (*)(void*, std::uint32_t, std::uint32_t, std::uint32_t);
+        using ActivateBody = void (*)(void*, std::uint32_t);
+
+        // Clears and sets the configured body flags, then wakes the body up.
+        bool adjustFlags(const BodyRef& body, const std::uint32_t flags) noexcept
+        {
+            __try {
+                const auto base = REL::Module::get().base();
+                if (g_clearFlags & flags) {
+                    reinterpret_cast<ChangeBodyFlags>(base + kDisableBodyFlags)(body.world, body.id, g_clearFlags & flags, 0);
+                }
+                if (g_setFlags & ~flags) {
+                    reinterpret_cast<ChangeBodyFlags>(base + kEnableBodyFlags)(body.world, body.id, g_setFlags & ~flags, 0);
+                }
+                if (g_activate) {
+                    reinterpret_cast<ActivateBody>(base + kActivateBody)(body.world, body.id);
+                }
                 return true;
             } __except (1) {
                 return false;
@@ -164,32 +198,69 @@ namespace npctouch::collision
             }
         }
 
-        // Moves every body part on layer `from` to layer `to`; returns how many moved.
-        int moveParts(RE::Actor* actor, const std::uint32_t from, const std::uint32_t to) noexcept
+        struct MoveResult
         {
+            int moved{ 0 };
+            int flagged{ 0 };
+            std::uint32_t before{ 0 };
+            std::uint32_t after{ 0 };
+        };
+
+        // Moves every body part on layer `from` to layer `to`. When `adjust` is
+        // set, parts on either layer also get their body flags adjusted.
+        MoveResult moveParts(RE::Actor* actor, const std::uint32_t from, const std::uint32_t to, const bool adjust) noexcept
+        {
+            MoveResult result{};
             auto* root = actor ? actor->Get3D() : nullptr;
             if (!root) {
-                return 0;
+                return result;
             }
-            int moved = 0;
             auto visit = [&](RE::NiCollisionObject* collision) {
                 if (g_faulted) {
                     return;
                 }
                 BodyRef body{};
                 std::uint32_t info{ 0 };
-                if (!resolveBody(collision, body) || !readFilter(body, info) || (info & kLayerMask) != from) {
+                if (!resolveBody(collision, body) || !readFilter(body, info)) {
                     return;
                 }
-                if (!writeFilter(body, (info & ~kLayerMask) | to)) {
-                    runtime::logWarning("Collision: changing an NPC body layer faulted; NPC hand collision is off");
+                const auto layer = info & kLayerMask;
+                if (layer == from) {
+                    if (!writeFilter(body, (info & ~kLayerMask) | to)) {
+                        runtime::logWarning("Collision: changing an NPC body layer faulted; NPC hand collision is off");
+                        g_faulted = true;
+                        return;
+                    }
+                    ++result.moved;
+                } else if (layer != to) {
+                    return;
+                }
+                if (!adjust) {
+                    return;
+                }
+                std::uint32_t flags{ 0 };
+                std::uint32_t motion{ 0 };
+                if (!readBodyState(body, flags, motion)) {
+                    return;
+                }
+                const bool needsChange = (flags & g_clearFlags) || (~flags & g_setFlags);
+                if (!needsChange && !g_activate) {
+                    return;
+                }
+                if (!adjustFlags(body, flags)) {
+                    runtime::logWarning("Collision: changing NPC body flags faulted; NPC hand collision is off");
                     g_faulted = true;
                     return;
                 }
-                ++moved;
+                if (needsChange) {
+                    if (result.flagged++ == 0) {
+                        result.before = flags;
+                        (void)readBodyState(body, result.after, motion);
+                    }
+                }
             };
             forEachCollisionObject(root, visit);
-            return moved;
+            return result;
         }
 
         float distance(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
@@ -221,8 +292,15 @@ namespace npctouch::collision
                 while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
                     key.pop_back();
                 }
-                const float value = std::strtof(line.c_str() + equals + 1, nullptr);
-                if (key == "bHandsCollideWithNPCs") {
+                const char* text = line.c_str() + equals + 1;
+                const float value = std::strtof(text, nullptr);
+                if (key == "sClearBodyFlags") {
+                    g_clearFlags = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
+                } else if (key == "sSetBodyFlags") {
+                    g_setFlags = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
+                } else if (key == "bWakeNPCBodies") {
+                    g_activate = value != 0.0f;
+                } else if (key == "bHandsCollideWithNPCs") {
                     g_enabled = value != 0.0f;
                 } else if (key == "fCollisionRadius" && value > 0.0f) {
                     g_radius = value;
@@ -230,8 +308,16 @@ namespace npctouch::collision
             }
         } catch (...) {
         }
-        char message[128]{};
-        std::snprintf(message, sizeof(message), "NPC hand collision: %s, radius %.0f", g_enabled ? "on" : "off", g_radius);
+        char message[160]{};
+        std::snprintf(
+            message,
+            sizeof(message),
+            "NPC hand collision: %s, radius %.0f, clear flags %08X, set flags %08X, wake %d",
+            g_enabled ? "on" : "off",
+            g_radius,
+            g_clearFlags,
+            g_setFlags,
+            g_activate ? 1 : 0);
         runtime::logInfo(message);
     }
 
@@ -268,14 +354,27 @@ namespace npctouch::collision
                 continue;
             }
             stillNear.insert(formId);
-            const int moved = moveParts(actor, kLayerBiped, kLayerBipedNoCc);
+            const auto result = moveParts(actor, kLayerBiped, kLayerBipedNoCc, true);
             if (g_faulted) {
                 return;
             }
-            if (moved > 0 && g_loggedSwitches < 30) {
+            if (result.moved > 0 && g_loggedSwitches < 30) {
                 ++g_loggedSwitches;
                 char message[160]{};
-                std::snprintf(message, sizeof(message), "Collision: '%s' %d body parts now touchable (layer 8 -> 33)", nameOf(actor), moved);
+                std::snprintf(message, sizeof(message), "Collision: '%s' %d body parts now touchable (layer 8 -> 33)", nameOf(actor), result.moved);
+                runtime::logInfo(message);
+            }
+            if (result.flagged > 0 && g_loggedFlagChanges < 30) {
+                ++g_loggedFlagChanges;
+                char message[192]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "Collision: '%s' %d body parts got new flags, e.g. %08X -> %08X",
+                    nameOf(actor),
+                    result.flagged,
+                    result.before,
+                    result.after);
                 runtime::logInfo(message);
             }
         }
@@ -287,7 +386,7 @@ namespace npctouch::collision
             }
             auto* actor = RE::TESForm::GetFormByID<RE::Actor>(*it);
             if (actor && actor->Get3D() && actor->DoGetSitSleepState() == RE::SIT_SLEEP_STATE::kNormal) {
-                (void)moveParts(actor, kLayerBipedNoCc, kLayerBiped);
+                (void)moveParts(actor, kLayerBipedNoCc, kLayerBiped, false);
             }
             it = g_switched.erase(it);
         }
