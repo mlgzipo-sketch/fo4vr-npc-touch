@@ -70,6 +70,8 @@ namespace npctouch::reactions
             bool grabReactions{ true };
             float grabAnnoyancePerSecond{ 0.6f };
             float breakFreeAnnoyance{ 6.0f };
+            // Even an annoyed NPC lets itself be held at least this long.
+            float breakFreeMinSeconds{ 3.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
@@ -182,6 +184,8 @@ namespace npctouch::reactions
                         g_settings.grabReactions = flag;
                     } else if (key == "fGrabAnnoyancePerSecond") {
                         g_settings.grabAnnoyancePerSecond = number;
+                    } else if (key == "fBreakFreeMinSeconds") {
+                        g_settings.breakFreeMinSeconds = number;
                     } else if (key == "fBreakFreeAnnoyance") {
                         g_settings.breakFreeAnnoyance = number;
                     } else if (key == "fBumpMoveDistance") {
@@ -732,7 +736,7 @@ namespace npctouch::reactions
         runtime::logInfo(message);
     }
 
-    bool onGrabHeld(RE::Actor* npc, const char* bone, const float seconds) noexcept
+    bool onGrabHeld(RE::Actor* npc, const char* bone, const float seconds, const float heldSeconds) noexcept
     {
         if (!g_settings.enabled || !g_settings.grabReactions || !npc || seconds <= 0.0f) {
             return false;
@@ -759,7 +763,7 @@ namespace npctouch::reactions
                 action = "start combat";
                 breakFree = true;
             }
-        } else if (state.annoyance >= g_settings.breakFreeAnnoyance) {
+        } else if (state.annoyance >= g_settings.breakFreeAnnoyance && heldSeconds >= g_settings.breakFreeMinSeconds) {
             // Pull back out of the hand, with an angry line if one is due.
             breakFree = true;
             action = playIdle(npc, kStaggerBackSmall) ? "break free (stagger)" : "break free";

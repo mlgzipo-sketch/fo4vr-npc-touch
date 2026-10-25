@@ -364,10 +364,19 @@ namespace
             std::vector<RE::NiAVObject*> grabCopies;
             // Arm grabs below the elbow also bend the elbow (two-bone reach).
             RE::NiAVObject* grabElbow{ nullptr };
+            // A share of an arm grab turns the collarbone, a share of a head
+            // grab the neck (the rest turns the head), so skin between them
+            // stretches less.
+            RE::NiAVObject* grabCollar{ nullptr };
+            RE::NiAVObject* grabHead{ nullptr };
+            // For the skin scan log: unskinned meshes near this point are listed.
+            RE::NiPoint3 scanNear{};
+            bool scanNearValid{ false };
             RE::NiPoint3 grabLocalFore{};   // grabbed point in the forearm's frame
             RE::NiPoint3 elbowAxisLocal{};  // elbow hinge in the upper arm's frame
             // Reaction to being held: last time the NPC was told.
             Clock::time_point lastHoldReaction{};
+            Clock::time_point grabStart{};
             // After the grip opens the limb eases back to the animation.
             bool releasing{ false };
             Clock::time_point releaseStart{};
@@ -389,6 +398,8 @@ namespace
         constexpr float kElbowMaxAngle = 3.10f;
         bool g_bendElbow{ true };
         bool g_scanSkinsEnabled{ true };
+        float g_collarShare{ 0.3f };
+        float g_neckShare{ 0.5f };
 
         std::array<HandState, 2> g_handStates{};
 
@@ -584,6 +595,8 @@ namespace
             state.grabTurned.clear();
             state.grabCopies.clear();
             state.grabElbow = nullptr;
+            state.grabCollar = nullptr;
+            state.grabHead = nullptr;
         }
 
         // The joint a grabbed bone turns around: arms at the shoulder, the head
@@ -877,8 +890,31 @@ namespace
             if (auto* geometry = object->IsGeometry()) {
                 g_scanStage = "skin instance";
                 auto* skin = geometry->GetRuntimeData().skinInstance.get();
-                if (looksLikeGameObject(skin) && readable(skin, sizeof(RE::BSSkin::Instance)) && skin->bonesData &&
-                    skin->bonesCount > 0 && skin->bonesCount < 256 && readable(skin->bonesData, skin->bonesCount * sizeof(void*))) {
+                const bool skinValid = looksLikeGameObject(skin) && readable(skin, sizeof(RE::BSSkin::Instance)) && skin->bonesData &&
+                                       skin->bonesCount > 0 && skin->bonesCount < 256 &&
+                                       readable(skin->bonesData, skin->bonesCount * sizeof(void*));
+                if (skin && !skinValid && logged < 24) {
+                    char text[200]{};
+                    std::snprintf(text, sizeof(text), "  skin '%s' has an unreadable skin instance %p", object->GetName().data(), static_cast<const void*>(skin));
+                    npctouch::runtime::logInfo(text);
+                    ++logged;
+                }
+                if (!skin && state.scanNearValid && !turnedByGrab(state, object) && length(object->world.translate - state.scanNear) < 30.0f && logged < 24) {
+                    char text[300]{};
+                    int used = std::snprintf(
+                        text,
+                        sizeof(text),
+                        "  rigid mesh '%s' %.0f from the joint, parents",
+                        object->GetName().data(),
+                        length(object->world.translate - state.scanNear));
+                    int level = 0;
+                    for (auto* up = object->parent; up && level < 4 && used < 260; up = up->parent, ++level) {
+                        used += std::snprintf(text + used, sizeof(text) - used, " < %s", up->GetName().data());
+                    }
+                    npctouch::runtime::logInfo(text);
+                    ++logged;
+                }
+                if (skinValid) {
                     auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
                     auto** worlds = static_cast<RE::NiTransform**>(skin->boneWorldXformData);
                     const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount &&
@@ -921,6 +957,12 @@ namespace
                                 bone->parent ? bone->parent->GetName().data() : "-");
                             used = std::min(used, static_cast<int>(sizeof(text)) - 1);
                         }
+                    }
+                    if ((turned + copies) > 0 && still == 0 && logged < 24) {
+                        char line[200]{};
+                        std::snprintf(line, sizeof(line), "  skin '%s' binds only to turned bones (%u)", object->GetName().data(), turned + copies);
+                        npctouch::runtime::logInfo(line);
+                        ++logged;
                     }
                     if ((turned + copies) > 0 && still > 0 && logged < 24) {
                         std::snprintf(text + used, sizeof(text) - used, " | world ptrs not on bone %u", foreign);
@@ -996,6 +1038,39 @@ namespace
             }
         }
 
+        // Turns a node (and everything below it) by a world turn about a pivot.
+        void turnNode(RE::NiAVObject* node, const RE::NiMatrix3& turn, const RE::NiPoint3& pivot) noexcept
+        {
+            const auto turnStored = turn.Transpose();
+            node->world.rotate = node->world.rotate * turnStored;
+            node->world.translate = pivot + turn * (node->world.translate - pivot);
+            if (auto* parent = node->parent) {
+                node->local.rotate = node->world.rotate * parent->world.rotate.Transpose();
+            }
+            turnChildren(node, turn, turnStored, pivot);
+        }
+
+        // Turn about pivot that moves point toward target by the given share,
+        // at most maxAngle radians. False when there is nothing to turn.
+        bool aimTurn(const RE::NiPoint3& pivot, const RE::NiPoint3& point, const RE::NiPoint3& target, const float share, const float maxAngle, RE::NiMatrix3& turn) noexcept
+        {
+            const RE::NiPoint3 from = point - pivot;
+            const RE::NiPoint3 to = target - pivot;
+            const float fromLength = length(from);
+            const float toLength = length(to);
+            if (fromLength < 1.0f || toLength < 1.0f || share <= 0.0f) {
+                return false;
+            }
+            float angle{ 0.0f };
+            (void)rotationBetween(from * (1.0f / fromLength), to * (1.0f / toLength), angle);
+            if (angle < 0.002f) {
+                return false;
+            }
+            const float fraction = std::min(share, maxAngle / angle);
+            turn = rotationBetween(from * (1.0f / fromLength), to * (1.0f / toLength), angle, fraction);
+            return true;
+        }
+
         // Bends the elbow so the shoulder-to-grab distance matches the
         // shoulder-to-hand distance (law of cosines); the shoulder turn after
         // it then aims the arm. The hinge axis was fixed in the upper arm's
@@ -1054,6 +1129,18 @@ namespace
                     return;
                 }
             }
+            auto grabPoint = [&]() {
+                if (auto* elbow = state.grabElbow) {
+                    return elbow->world.translate + elbow->world.rotate.Transpose() * state.grabLocalFore * elbow->world.scale;
+                }
+                return joint->world.translate + joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
+            };
+            if (auto* collar = state.grabCollar) {
+                RE::NiMatrix3 collarTurn{};
+                if (aimTurn(collar->world.translate, grabPoint(), target, g_collarShare * fraction, 0.45f, collarTurn)) {
+                    turnNode(collar, collarTurn, collar->world.translate);
+                }
+            }
             RE::NiPoint3 current = joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
             if (state.grabElbow) {
                 bendElbow(state, joint, state.grabElbow, target, fraction);
@@ -1068,7 +1155,9 @@ namespace
                 return;
             }
             float angle{ 0.0f };
-            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle, fraction);
+            // A head grab turns the neck only part of the way; the head does the rest.
+            const float jointShare = state.grabHead ? std::clamp(g_neckShare, 0.0f, 1.0f) : 1.0f;
+            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle, fraction * jointShare);
             // If last frame's pose is still there, the game did not re-animate
             // the joint since; worth knowing for timing.
             if (angle < 0.02f) {
@@ -1105,6 +1194,12 @@ namespace
                 copy->world.rotate = copy->world.rotate * turnStored;
                 copy->world.translate = pivot + turn * (copy->world.translate - pivot);
                 ++state.copiesTurned;
+            }
+            if (auto* head = state.grabHead; head && jointShare < 1.0f) {
+                RE::NiMatrix3 headTurn{};
+                if (aimTurn(head->world.translate, grabPoint(), target, fraction, 3.2f, headTurn)) {
+                    turnNode(head, headTurn, head->world.translate);
+                }
             }
             state.lastJointWorld = joint->world;
             if (state.skinBone) {
@@ -1169,14 +1264,25 @@ namespace
                     const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                     if (key == "bBendElbow") {
                         g_bendElbow = value != 0.0f;
+                    } else if (key == "fCollarboneShare") {
+                        g_collarShare = std::clamp(value, 0.0f, 1.0f);
+                    } else if (key == "fNeckShare") {
+                        g_neckShare = std::clamp(value, 0.0f, 1.0f);
                     } else if (key == "bScanSkins") {
                         g_scanSkinsEnabled = value != 0.0f;
                     }
                 }
             } catch (...) {
             }
-            char message[80]{};
-            std::snprintf(message, sizeof(message), "Grab settings: bend elbow %d, scan skins %d", g_bendElbow ? 1 : 0, g_scanSkinsEnabled ? 1 : 0);
+            char message[160]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "Grab settings: bend elbow %d, scan skins %d, collarbone share %.2f, neck share %.2f",
+                g_bendElbow ? 1 : 0,
+                g_scanSkinsEnabled ? 1 : 0,
+                g_collarShare,
+                g_neckShare);
             npctouch::runtime::logInfo(message);
         }
 
@@ -1218,7 +1324,11 @@ namespace
                     const float seconds = std::chrono::duration<float>(now - state.lastHoldReaction).count();
                     if (seconds >= 1.0f) {
                         state.lastHoldReaction = now;
-                        if (npctouch::reactions::onGrabHeld(actor, state.grabbedBone, std::min(seconds, 2.0f))) {
+                        if (npctouch::reactions::onGrabHeld(
+                                actor,
+                                state.grabbedBone,
+                                std::min(seconds, 2.0f),
+                                std::chrono::duration<float>(now - state.grabStart).count())) {
                             npctouch::runtime::logInfo("GRAB: NPC pulled free");
                             state.releasing = true;
                             state.releaseStart = now;
@@ -1280,6 +1390,24 @@ namespace
             }
             state.skinBone = nullptr;
             state.grabCopies.clear();
+            state.grabCollar = nullptr;
+            state.grabHead = nullptr;
+            state.scanNearValid = false;
+            if (joint) {
+                const std::string_view name = joint->GetName();
+                if (name.find("UpperArm") != std::string_view::npos && joint->parent && g_collarShare > 0.0f) {
+                    state.grabCollar = joint->parent;
+                }
+                if (name == "Neck") {
+                    if (auto* head = findNode(joint, "Head")) {
+                        state.scanNear = head->world.translate;
+                        state.scanNearValid = true;
+                        if (g_neckShare < 1.0f) {
+                            state.grabHead = head;
+                        }
+                    }
+                }
+            }
             if (joint && root && g_scanSkinsEnabled && !g_scanBroken) {
                 int logged = 0;
                 char text[200]{};
@@ -1327,6 +1455,7 @@ namespace
                 setUpElbow(state, hit.actor, root, joint, hit.bone);
             }
             state.lastHoldReaction = Clock::now();
+            state.grabStart = state.lastHoldReaction;
             std::snprintf(
                 message,
                 sizeof(message),
