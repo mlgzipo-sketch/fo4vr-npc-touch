@@ -1457,11 +1457,27 @@ namespace
                         g_neckShare = std::clamp(value, 0.0f, 1.0f);
                     } else if (key == "bScanSkins") {
                         g_scanSkinsEnabled = value != 0.0f;
+                    } else if (key == "bFlinch") {
+                        g_flinchEnabled = value != 0.0f;
+                    } else if (key == "fFlinchFollow") {
+                        g_flinchFollow = std::clamp(value, 0.0f, 1.0f);
+                    } else if (key == "fFlinchStiffness") {
+                        g_flinchStiffness = std::clamp(value, 1.0f, 40.0f);
+                    } else if (key == "fFlinchDamping") {
+                        g_flinchDamping = std::clamp(value, 0.05f, 2.0f);
+                    } else if (key == "fFlinchMinSpeed") {
+                        g_flinchMinSpeed = std::max(value, 0.0f);
+                    } else if (key == "fFlinchMaxTorso") {
+                        g_flinchMaxTorso = std::clamp(value, 0.0f, 1.0f);
+                    } else if (key == "fFlinchMaxHead") {
+                        g_flinchMaxHead = std::clamp(value, 0.0f, 1.2f);
+                    } else if (key == "fFlinchMaxArm") {
+                        g_flinchMaxArm = std::clamp(value, 0.0f, 1.5f);
                     }
                 }
             } catch (...) {
             }
-            char message[160]{};
+            char message[240]{};
             std::snprintf(
                 message,
                 sizeof(message),
@@ -1471,6 +1487,251 @@ namespace
                 g_collarShare,
                 g_neckShare);
             npctouch::runtime::logInfo(message);
+            std::snprintf(
+                message,
+                sizeof(message),
+                "Flinch settings: on %d, follow %.2f, stiffness %.1f, damping %.2f, min speed %.0f, max torso/head/arm %.2f/%.2f/%.2f",
+                g_flinchEnabled ? 1 : 0,
+                g_flinchFollow,
+                g_flinchStiffness,
+                g_flinchDamping,
+                g_flinchMinSpeed,
+                g_flinchMaxTorso,
+                g_flinchMaxHead,
+                g_flinchMaxArm);
+            npctouch::runtime::logInfo(message);
+        }
+
+        // Flinch: a touched NPC gives way. The touched part (upper body, head
+        // or arm) turns about its joint with the hand's push and springs back.
+        // Each flinch keeps its own pose state, so the skin fixes of grabs
+        // (bone copies, linked slots) apply to it too.
+        bool g_flinchEnabled{ true };
+        float g_flinchFollow{ 0.7f };      // share of the hand's motion the body takes
+        float g_flinchStiffness{ 9.0f };   // spring frequency back to the animation, rad/s
+        float g_flinchDamping{ 0.55f };    // damping ratio of that spring
+        float g_flinchMinSpeed{ 20.0f };   // slower hands only touch
+        float g_flinchMaxTorso{ 0.25f };
+        float g_flinchMaxHead{ 0.5f };
+        float g_flinchMaxArm{ 0.7f };
+
+        struct Flinch
+        {
+            bool active{ false };
+            std::uint32_t formId{ 0 };
+            const char* jointName{ nullptr };
+            RE::NiAVObject* root{ nullptr };
+            float maxAngle{ 0.0f };
+            RE::NiPoint3 angle{};     // rotation vector: axis * radians
+            RE::NiPoint3 spin{};      // its rate, rad/s
+            Clock::time_point last{};
+            Clock::time_point lastContact{};
+            HandState pose{};
+        };
+
+        std::array<Flinch, 4> g_flinches{};
+
+        // The joint a touch on this bone turns, and how far it may go.
+        const char* flinchJoint(const char* bone, float& maxAngle) noexcept
+        {
+            if (!bone) {
+                return nullptr;
+            }
+            if (std::strncmp(bone, "LArm_", 5) == 0 || std::strncmp(bone, "RArm_", 5) == 0) {
+                maxAngle = g_flinchMaxArm;
+                return bone[0] == 'L' ? "LArm_UpperArm" : "RArm_UpperArm";
+            }
+            if (std::strcmp(bone, "Head") == 0 || std::strcmp(bone, "Neck") == 0) {
+                maxAngle = g_flinchMaxHead;
+                return "Neck";
+            }
+            if (std::strcmp(bone, "Chest") == 0 || std::strcmp(bone, "SPINE2") == 0) {
+                maxAngle = g_flinchMaxTorso;
+                return "SPINE2";
+            }
+            if (std::strcmp(bone, "SPINE1") == 0 || std::strcmp(bone, "Pelvis") == 0) {
+                maxAngle = g_flinchMaxTorso * 0.6f;
+                return "SPINE1";
+            }
+            return nullptr;
+        }
+
+        // Fills a pose state with the bones a turn of this joint moves, finds
+        // the clothing bone copies and skin slots that must follow.
+        void preparePose(HandState& pose, RE::NiAVObject* root, RE::NiAVObject* joint) noexcept
+        {
+            pose.grabNames.clear();
+            pose.grabTurned.clear();
+            pose.grabCopies.clear();
+            pose.skinLinks.clear();
+            pose.grabCollar = nullptr;
+            pose.grabHead = nullptr;
+            pose.scanNearValid = false;
+            collectNames(joint, pose.grabNames);
+            pose.grabTurned.push_back(joint);
+            if (auto* parent = joint->parent) {
+                const std::string_view ownName = joint->GetName();
+                auto& siblings = parent->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < siblings.size(); ++index) {
+                    auto* sibling = siblings[index].get();
+                    if (!sibling || sibling == joint) {
+                        continue;
+                    }
+                    const std::string_view name = sibling->GetName();
+                    if (name.size() > 5 && ownName.size() >= 5 && name.substr(0, 5) == ownName.substr(0, 5) &&
+                        name.find("Twist") != std::string_view::npos) {
+                        collectNames(sibling, pose.grabNames);
+                        pose.grabTurned.push_back(sibling);
+                    }
+                }
+            }
+            if (g_scanSkinsEnabled) {
+                int logged = 30;  // no per-mesh lines for flinches
+                int faults = 0;
+                pose.scanNodes.clear();
+                if (tryCollectNodes(pose, root)) {
+                    (void)tryScanSkins(pose, root, logged, faults);
+                }
+                pose.scanNodes.clear();
+            }
+        }
+
+        bool grabbedByHand(const std::uint32_t formId) noexcept
+        {
+            for (const auto& state : g_handStates) {
+                if (state.grabbedFormId == formId) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // A hand inside an NPC's reach pushes the touched part along.
+        void pushFlinch(const HandState& hand, const Hit& hit, const float seconds) noexcept
+        {
+            if (!g_flinchEnabled || !hit.actor || hit.actor->IsDead(false) || grabbedByHand(hit.actor->GetFormID())) {
+                return;
+            }
+            const RE::NiPoint3 velocity{ hand.velocity[0], hand.velocity[1], hand.velocity[2] };
+            if (length(velocity) < g_flinchMinSpeed) {
+                return;
+            }
+            float maxAngle{ 0.0f };
+            const char* jointName = flinchJoint(hit.bone, maxAngle);
+            auto* root = jointName ? hit.actor->Get3D() : nullptr;
+            auto* joint = root ? findNode(root, jointName) : nullptr;
+            if (!joint || maxAngle <= 0.0f) {
+                return;
+            }
+            const RE::NiPoint3 arm = hand.position - joint->world.translate;
+            const float reach = length(arm);
+            if (reach < 5.0f) {
+                return;
+            }
+            const auto formId = hit.actor->GetFormID();
+            Flinch* flinch = nullptr;
+            for (auto& entry : g_flinches) {
+                if (entry.active && entry.formId == formId && entry.jointName == jointName && entry.root == root) {
+                    flinch = &entry;
+                    break;
+                }
+            }
+            const auto now = Clock::now();
+            if (!flinch) {
+                for (auto& entry : g_flinches) {
+                    if (!entry.active) {
+                        flinch = &entry;
+                        break;
+                    }
+                }
+                if (!flinch) {
+                    return;
+                }
+                flinch->active = true;
+                flinch->formId = formId;
+                flinch->jointName = jointName;
+                flinch->root = root;
+                flinch->maxAngle = maxAngle;
+                flinch->angle = {};
+                flinch->spin = {};
+                flinch->last = now;
+                preparePose(flinch->pose, root, joint);
+                char message[200]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "FLINCH: '%s' %s gives way (hand %.0f u/s), %zu bone copies, %zu skin slots follow",
+                    actorName(hit.actor),
+                    jointName,
+                    length(velocity),
+                    flinch->pose.grabCopies.size(),
+                    flinch->pose.skinLinks.size());
+                npctouch::runtime::logInfo(message);
+            }
+            // The hand's turn rate about the joint; the body's spin is drawn
+            // toward a share of it while the hand is in contact.
+            const RE::NiPoint3 handSpin = cross(arm, velocity) * (1.0f / (reach * reach));
+            const float blend = std::min(1.0f, 20.0f * seconds);
+            flinch->spin = flinch->spin + (handSpin * g_flinchFollow - flinch->spin) * blend;
+            flinch->lastContact = now;
+        }
+
+        // Steps every flinch's spring and poses it after the animation.
+        void updateFlinches() noexcept
+        {
+            const auto now = Clock::now();
+            for (auto& flinch : g_flinches) {
+                if (!flinch.active) {
+                    continue;
+                }
+                const float seconds = std::clamp(std::chrono::duration<float>(now - flinch.last).count(), 0.0f, 0.05f);
+                flinch.last = now;
+                auto* actor = RE::TESForm::GetFormByID<RE::Actor>(flinch.formId);
+                auto* root = actor ? actor->Get3D() : nullptr;
+                if (!root || root != flinch.root || actor->IsDead(false) || grabbedByHand(flinch.formId)) {
+                    flinch.active = false;
+                    continue;
+                }
+                const float k = g_flinchStiffness * g_flinchStiffness;
+                const float c = 2.0f * g_flinchDamping * g_flinchStiffness;
+                flinch.spin = flinch.spin + (flinch.angle * -k - flinch.spin * c) * seconds;
+                flinch.angle = flinch.angle + flinch.spin * seconds;
+                float angle = length(flinch.angle);
+                if (angle > flinch.maxAngle) {
+                    flinch.angle = flinch.angle * (flinch.maxAngle / angle);
+                    angle = flinch.maxAngle;
+                    // Stop pushing further at the limit.
+                    const RE::NiPoint3 axis = flinch.angle * (1.0f / angle);
+                    const float outward = dot(flinch.spin, axis);
+                    if (outward > 0.0f) {
+                        flinch.spin = flinch.spin - axis * outward;
+                    }
+                }
+                const bool resting = angle < 0.002f && length(flinch.spin) < 0.02f &&
+                                     now - flinch.lastContact > std::chrono::milliseconds(150);
+                if (resting) {
+                    flinch.active = false;
+                    continue;
+                }
+                auto* joint = findNode(root, flinch.jointName);
+                if (!joint || !joint->parent || angle < 1e-5f) {
+                    continue;
+                }
+                const auto turn = axisAngle(flinch.angle * (1.0f / angle), angle);
+                const auto turnStored = turn.Transpose();
+                const RE::NiPoint3 pivot = joint->world.translate;
+                auto& pose = flinch.pose;
+                joint->world.rotate = joint->world.rotate * turnStored;
+                joint->local.rotate = joint->world.rotate * joint->parent->world.rotate.Transpose();
+                turnChildren(joint, turn, turnStored, pivot);
+                turnTwistSiblings(joint, turn, turnStored);
+                turnCopies(pose, root, turn, turnStored, pivot, false);
+                for (auto* copy : pose.grabCopies) {
+                    copy->world.rotate = copy->world.rotate * turnStored;
+                    copy->world.translate = pivot + turn * (copy->world.translate - pivot);
+                }
+                moveLinkedSlots(pose);
+            }
         }
 
         void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
@@ -1684,6 +1945,9 @@ namespace
                 }
                 updateGrab(handIds[index], state, hit, gripHeld(ownerToken, handIds[index], state));
                 const bool inside = hit.actor && hit.gap <= kHandReach;
+                if (inside && state.grabbedFormId == 0) {
+                    pushFlinch(state, hit, 1.0f / 90.0f);
+                }
                 const bool released = !hit.actor || hit.gap > kHandReach + kReleaseMargin ||
                                       (state.touchedFormId != 0 && hit.actor->GetFormID() != state.touchedFormId);
 
@@ -1722,6 +1986,7 @@ namespace
                     state.touchedBone = nullptr;
                 }
             }
+            updateFlinches();
         }
     }
 
