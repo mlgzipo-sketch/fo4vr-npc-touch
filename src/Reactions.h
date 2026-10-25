@@ -15,6 +15,10 @@ namespace npctouch::reactions
     // the hand's velocity in game units per second.
     void onTouch(RE::Actor* npc, const char* bone, const float (&handVelocity)[3]) noexcept;
 
+    // Called about once a second while a hand holds the NPC, with the
+    // seconds since the last call. Returns true when the NPC pulls free.
+    bool onGrabHeld(RE::Actor* npc, const char* bone, float seconds) noexcept;
+
     // Moves the NPC to a new spot (Papyrus SetPosition), for dragging.
     bool moveActor(RE::Actor* npc, float x, float y, float z) noexcept;
 

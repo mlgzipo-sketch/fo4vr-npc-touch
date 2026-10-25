@@ -64,6 +64,12 @@ namespace npctouch::reactions
             // How far NPCs step away when the player bumps into them; the game
             // uses 75-128. Negative keeps the game's values.
             float bumpMoveDistance{ 0.0f };
+            // While an NPC is held, annoyance grows by this much per second
+            // (twice on the head, three times on chest/pelvis). Once it
+            // reaches breakFreeAnnoyance the NPC pulls free. Companions never mind.
+            bool grabReactions{ true };
+            float grabAnnoyancePerSecond{ 0.6f };
+            float breakFreeAnnoyance{ 6.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
@@ -172,7 +178,13 @@ namespace npctouch::reactions
                     const auto value = trim(line.substr(equals + 1));
                     const float number = std::strtof(value.c_str(), nullptr);
                     const bool flag = number != 0.0f;
-                    if (key == "fBumpMoveDistance") {
+                    if (key == "bGrabReactions") {
+                        g_settings.grabReactions = flag;
+                    } else if (key == "fGrabAnnoyancePerSecond") {
+                        g_settings.grabAnnoyancePerSecond = number;
+                    } else if (key == "fBreakFreeAnnoyance") {
+                        g_settings.breakFreeAnnoyance = number;
+                    } else if (key == "fBumpMoveDistance") {
                         g_settings.bumpMoveDistance = number;
                     } else if (key == "bEnableReactions") {
                         g_settings.enabled = flag;
@@ -718,6 +730,74 @@ namespace npctouch::reactions
             action,
             spoken);
         runtime::logInfo(message);
+    }
+
+    bool onGrabHeld(RE::Actor* npc, const char* bone, const float seconds) noexcept
+    {
+        if (!g_settings.enabled || !g_settings.grabReactions || !npc || seconds <= 0.0f) {
+            return false;
+        }
+        const auto now = Clock::now();
+        auto& state = g_states[npc->GetFormID()];
+        decay(state, now);
+        lookAtPlayer(npc, state, now);
+
+        const auto* companion = findCompanion(npc);
+        if (companion || RE::IsPlayerTeammate(*npc)) {
+            return false;
+        }
+        const Zone zone = zoneOf(bone);
+        const float factor = zone == Zone::Intimate ? 3.0f : zone == Zone::Head ? 2.0f : 1.0f;
+        state.annoyance += g_settings.grabAnnoyancePerSecond * factor * seconds;
+
+        const char* action = "hold";
+        std::uint32_t spoken{ 0 };
+        bool breakFree = false;
+        if (g_settings.allowCombat && !state.fighting && state.annoyance >= g_settings.annoyanceForCombat) {
+            if (callActor(npc, "StartCombat", static_cast<RE::Actor*>(RE::PlayerCharacter::GetSingleton()), false)) {
+                state.fighting = true;
+                action = "start combat";
+                breakFree = true;
+            }
+        } else if (state.annoyance >= g_settings.breakFreeAnnoyance) {
+            // Pull back out of the hand, with an angry line if one is due.
+            breakFree = true;
+            action = playIdle(npc, kStaggerBackSmall) ? "break free (stagger)" : "break free";
+            const auto topic = pickTopic(g_settings.warningTopics);
+            if (topic && now - state.lastSpeech >= std::chrono::milliseconds(1500) && say(npc, topic)) {
+                state.lastSpeech = now;
+                spoken = topic;
+            }
+            state.warned = true;
+        } else {
+            const bool canSpeak = now - state.lastSpeech >=
+                                  std::chrono::milliseconds(static_cast<int>(g_settings.speechCooldownSeconds * 1000.0f));
+            const bool warning = state.annoyance >= g_settings.annoyanceForWarning;
+            if ((warning && !state.warned) || (canSpeak && warning)) {
+                const auto topic = pickTopic(g_settings.warningTopics);
+                if (topic && now - state.lastSpeech >= std::chrono::milliseconds(1500) && say(npc, topic)) {
+                    state.lastSpeech = now;
+                    spoken = topic;
+                    action = "warning line";
+                    state.warned = true;
+                }
+            }
+        }
+
+        if (spoken || breakFree) {
+            char message[200]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "GRAB REACTION: '%s' zone=%s annoyance=%.1f -> %s topic=%08X",
+                actorName(npc),
+                zoneName(zone),
+                state.annoyance,
+                action,
+                spoken);
+            runtime::logInfo(message);
+        }
+        return breakFree;
     }
 
     bool moveActor(RE::Actor* npc, const float x, const float y, const float z) noexcept

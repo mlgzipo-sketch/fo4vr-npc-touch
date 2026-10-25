@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -361,6 +362,12 @@ namespace
             std::uint32_t copiesTurned{ 0 };
             // Bones that worn skins bind to outside the skeleton, turned by hand.
             std::vector<RE::NiAVObject*> grabCopies;
+            // Arm grabs below the elbow also bend the elbow (two-bone reach).
+            RE::NiAVObject* grabElbow{ nullptr };
+            RE::NiPoint3 grabLocalFore{};   // grabbed point in the forearm's frame
+            RE::NiPoint3 elbowAxisLocal{};  // elbow hinge in the upper arm's frame
+            // Reaction to being held: last time the NPC was told.
+            Clock::time_point lastHoldReaction{};
             // After the grip opens the limb eases back to the animation.
             bool releasing{ false };
             Clock::time_point releaseStart{};
@@ -377,6 +384,10 @@ namespace
         constexpr float kGrabBreak = 40.0f;
         // How long a released limb takes to ease back to the animation.
         constexpr float kReleaseSeconds = 0.35f;
+        // Elbow bend limits (interior angle between upper arm and forearm).
+        constexpr float kElbowMinAngle = 0.45f;
+        constexpr float kElbowMaxAngle = 3.10f;
+        bool g_bendElbow{ true };
 
         std::array<HandState, 2> g_handStates{};
 
@@ -571,6 +582,7 @@ namespace
             state.grabNames.clear();
             state.grabTurned.clear();
             state.grabCopies.clear();
+            state.grabElbow = nullptr;
         }
 
         // The joint a grabbed bone turns around: arms at the shoulder, the head
@@ -595,6 +607,36 @@ namespace
         float length(const RE::NiPoint3& v) noexcept
         {
             return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        }
+
+        RE::NiPoint3 cross(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+        {
+            return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+        }
+
+        float dot(const RE::NiPoint3& a, const RE::NiPoint3& b) noexcept
+        {
+            return a.x * b.x + a.y * b.y + a.z * b.z;
+        }
+
+        // Rotation (v' = R v) by angle about a unit axis.
+        RE::NiMatrix3 axisAngle(const RE::NiPoint3& axis, const float angle) noexcept
+        {
+            const float sn = std::sin(angle);
+            const float cs = std::cos(angle);
+            const float t = 1.0f - cs;
+            const float x = axis.x, y = axis.y, z = axis.z;
+            RE::NiMatrix3 r{};
+            r.entry[0][0] = cs + x * x * t;
+            r.entry[0][1] = x * y * t - z * sn;
+            r.entry[0][2] = x * z * t + y * sn;
+            r.entry[1][0] = y * x * t + z * sn;
+            r.entry[1][1] = cs + y * y * t;
+            r.entry[1][2] = y * z * t - x * sn;
+            r.entry[2][0] = z * x * t - y * sn;
+            r.entry[2][1] = z * y * t + x * sn;
+            r.entry[2][2] = cs + z * z * t;
+            return r;
         }
 
         // Rotation (v' = R v) that turns unit vector a onto unit vector b, or
@@ -918,6 +960,48 @@ namespace
             }
         }
 
+        // Bends the elbow so the shoulder-to-grab distance matches the
+        // shoulder-to-hand distance (law of cosines); the shoulder turn after
+        // it then aims the arm. The hinge axis was fixed in the upper arm's
+        // frame when the grab began.
+        void bendElbow(HandState& state, RE::NiAVObject* shoulder, RE::NiAVObject* elbow, const RE::NiPoint3& target, const float fraction) noexcept
+        {
+            const RE::NiPoint3 s = shoulder->world.translate;
+            const RE::NiPoint3 e = elbow->world.translate;
+            const RE::NiPoint3 g = e + elbow->world.rotate.Transpose() * state.grabLocalFore * elbow->world.scale;
+            const float a = length(e - s);
+            const float b = length(g - e);
+            if (a < 4.0f || b < 4.0f) {
+                return;
+            }
+            const float d = std::clamp(length(target - s), std::abs(a - b) + 0.5f, a + b - 0.5f);
+            const float wantedAngle = std::clamp(std::acos(std::clamp((a * a + b * b - d * d) / (2.0f * a * b), -1.0f, 1.0f)), kElbowMinAngle, kElbowMaxAngle);
+            RE::NiPoint3 axis = shoulder->world.rotate.Transpose() * state.elbowAxisLocal;
+            const float axisLength = length(axis);
+            if (axisLength < 0.5f) {
+                return;
+            }
+            axis = axis * (1.0f / axisLength);
+            const RE::NiPoint3 u = (s - e) * (1.0f / a);
+            const RE::NiPoint3 v = (g - e) * (1.0f / b);
+            float angle = std::atan2(dot(cross(u, v), axis), dot(u, v));
+            if (angle < 0.0f) {
+                // Bent past straight the wrong way: measure it as more than 180 degrees.
+                angle += 6.2831853f;
+            }
+            const float delta = (wantedAngle - angle) * fraction;
+            if (std::abs(delta) < 0.002f) {
+                return;
+            }
+            const auto turn = axisAngle(axis, delta);
+            const auto turnStored = turn.Transpose();
+            elbow->world.rotate = elbow->world.rotate * turnStored;
+            if (auto* parent = elbow->parent) {
+                elbow->local.rotate = elbow->world.rotate * parent->world.rotate.Transpose();
+            }
+            turnChildren(elbow, turn, turnStored, e);
+        }
+
         // Turns the joint so the grabbed point sits in the hand.
         void poseGrab(HandState& state, RE::NiAVObject* joint) noexcept
         {
@@ -925,7 +1009,6 @@ namespace
             if (!parent) {
                 return;
             }
-            const RE::NiPoint3 current = joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
             float fraction = 1.0f;
             RE::NiPoint3 target = state.position;
             if (state.releasing) {
@@ -934,6 +1017,13 @@ namespace
                 if (fraction <= 0.0f) {
                     return;
                 }
+            }
+            RE::NiPoint3 current = joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
+            if (state.grabElbow) {
+                bendElbow(state, joint, state.grabElbow, target, fraction);
+                auto* elbow = state.grabElbow;
+                const RE::NiPoint3 point = elbow->world.translate + elbow->world.rotate.Transpose() * state.grabLocalFore * elbow->world.scale;
+                current = point - joint->world.translate;
             }
             const RE::NiPoint3 wanted = target - joint->world.translate;
             const float currentLength = length(current);
@@ -986,6 +1076,72 @@ namespace
             }
         }
 
+        // For a grab on the forearm or hand, remember the grabbed point in the
+        // forearm's frame and the elbow's hinge axis in the upper arm's frame.
+        // The hinge comes from the current bend; a straight arm bends forward.
+        void setUpElbow(HandState& state, RE::Actor* actor, RE::NiAVObject* root, RE::NiAVObject* shoulder, const char* bone) noexcept
+        {
+            state.grabElbow = nullptr;
+            if (!g_bendElbow || !bone || (std::strstr(bone, "ForeArm") == nullptr && std::strstr(bone, "_Hand") == nullptr)) {
+                return;
+            }
+            const char* elbowName = bone[0] == 'L' ? "LArm_ForeArm1" : "RArm_ForeArm1";
+            auto* elbow = findNode(root, elbowName);
+            if (!elbow || elbow->world.scale <= 0.0f) {
+                return;
+            }
+            const RE::NiPoint3 s = shoulder->world.translate;
+            const RE::NiPoint3 e = elbow->world.translate;
+            const RE::NiPoint3 g = state.position;
+            const float a = length(e - s);
+            const float b = length(g - e);
+            if (a < 4.0f || b < 4.0f) {
+                return;
+            }
+            RE::NiPoint3 axis = cross((s - e) * (1.0f / a), (g - e) * (1.0f / b));
+            const char* source = "current bend";
+            if (length(axis) < 0.17f) {
+                // Straight arm: hinge along the body's left, so the forearm comes forward.
+                const float heading = actor->data.angle.z;
+                axis = { -std::cos(heading), std::sin(heading), 0.0f };
+                source = "body left";
+            }
+            axis = axis * (1.0f / length(axis));
+            state.grabElbow = elbow;
+            state.grabLocalFore = elbow->world.rotate * (g - e) * (1.0f / elbow->world.scale);
+            state.elbowAxisLocal = shoulder->world.rotate * axis;
+            state.grabReach = std::max(state.grabReach, a + b);
+            char text[200]{};
+            std::snprintf(text, sizeof(text), "  elbow: upper %.0f, lower %.0f, hinge from %s", a, b, source);
+            npctouch::runtime::logInfo(text);
+        }
+
+        void loadGrabSettings() noexcept
+        {
+            try {
+                std::ifstream file("Data/F4SE/Plugins/NpcTouch.ini");
+                std::string line;
+                while (file && std::getline(file, line)) {
+                    const auto equals = line.find('=');
+                    if (line.empty() || line[0] == ';' || equals == std::string::npos) {
+                        continue;
+                    }
+                    auto key = line.substr(0, equals);
+                    while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
+                        key.pop_back();
+                    }
+                    const float value = std::strtof(line.c_str() + equals + 1, nullptr);
+                    if (key == "bBendElbow") {
+                        g_bendElbow = value != 0.0f;
+                    }
+                }
+            } catch (...) {
+            }
+            char message[80]{};
+            std::snprintf(message, sizeof(message), "Grab settings: bend elbow %d", g_bendElbow ? 1 : 0);
+            npctouch::runtime::logInfo(message);
+        }
+
         void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
         {
             const bool pressed = grip && !state.gripWasHeld;
@@ -1018,6 +1174,19 @@ namespace
                         return;
                     }
                     poseGrab(state, state.grabJoint);
+                }
+                if (!state.releasing) {
+                    const auto now = Clock::now();
+                    const float seconds = std::chrono::duration<float>(now - state.lastHoldReaction).count();
+                    if (seconds >= 1.0f) {
+                        state.lastHoldReaction = now;
+                        if (npctouch::reactions::onGrabHeld(actor, state.grabbedBone, std::min(seconds, 2.0f))) {
+                            npctouch::runtime::logInfo("GRAB: NPC pulled free");
+                            state.releasing = true;
+                            state.releaseStart = now;
+                            state.releaseTarget = state.position;
+                        }
+                    }
                 }
                 return;
             }
@@ -1117,7 +1286,9 @@ namespace
                 const RE::NiPoint3 offset = state.position - joint->world.translate;
                 state.grabReach = length(offset);
                 state.grabLocal = joint->world.rotate * offset * (1.0f / joint->world.scale);
+                setUpElbow(state, hit.actor, root, joint, hit.bone);
             }
+            state.lastHoldReaction = Clock::now();
             std::snprintf(
                 message,
                 sizeof(message),
@@ -1328,6 +1499,7 @@ namespace
             npctouch::reactions::initialize();
             npctouch::collision::initialize();
             npctouch::proxies::initialize();
+            loadGrabSettings();
             reactionsReady = true;
         }
         return true;
