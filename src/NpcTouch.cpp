@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -930,13 +931,16 @@ namespace
                 collectNames(joint, state.grabNames);
                 state.grabTurned.push_back(joint);
                 if (auto* parent = joint->parent) {
-                    const auto jointName = joint->GetName();
+                    const std::string_view ownName = joint->GetName();
                     auto& siblings = parent->GetRuntimeData().children;
                     for (std::uint16_t index = 0; index < siblings.size(); ++index) {
                         auto* sibling = siblings[index].get();
-                        const auto name = sibling ? sibling->GetName() : RE::BSFixedString{};
-                        if (sibling && sibling != joint && name.size() > 5 && jointName.size() >= 5 &&
-                            std::strncmp(name.data(), jointName.data(), 5) == 0 && std::strstr(name.data(), "Twist")) {
+                        if (!sibling || sibling == joint) {
+                            continue;
+                        }
+                        const std::string_view name = sibling->GetName();
+                        if (name.size() > 5 && ownName.size() >= 5 && name.substr(0, 5) == ownName.substr(0, 5) &&
+                            name.find("Twist") != std::string_view::npos) {
                             collectNames(sibling, state.grabNames);
                             state.grabTurned.push_back(sibling);
                         }
