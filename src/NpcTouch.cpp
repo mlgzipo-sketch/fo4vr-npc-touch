@@ -833,6 +833,39 @@ namespace
         std::uint32_t g_scanBone = 0;
         bool g_scanBroken = false;
 
+        // ROCK treats any fault inside our frame callback as fatal before our own
+        // SEH handlers run, so raw pointers from the skin data are checked
+        // before they are touched: committed readable memory, and for objects a
+        // vtable inside the game's read-only data.
+        bool readable(const void* address, const std::size_t size) noexcept
+        {
+            if (!address) {
+                return false;
+            }
+            REX::W32::MEMORY_BASIC_INFORMATION info{};
+            if (REX::W32::VirtualQuery(address, &info, sizeof(info)) == 0 || info.state != REX::W32::MEM_COMMIT) {
+                return false;
+            }
+            constexpr std::uint32_t readableMask = REX::W32::PAGE_READONLY | REX::W32::PAGE_READWRITE | REX::W32::PAGE_WRITECOPY |
+                                                   REX::W32::PAGE_EXECUTE_READ | REX::W32::PAGE_EXECUTE_READWRITE;
+            if ((info.protect & readableMask) == 0 || (info.protect & 0x100u) != 0) {  // 0x100 = PAGE_GUARD
+                return false;
+            }
+            const auto start = reinterpret_cast<std::uintptr_t>(address);
+            const auto end = reinterpret_cast<std::uintptr_t>(info.baseAddress) + info.regionSize;
+            return start + size <= end;
+        }
+
+        bool looksLikeGameObject(const void* object) noexcept
+        {
+            if (!object || (reinterpret_cast<std::uintptr_t>(object) & 7) != 0 || !readable(object, 0x40)) {
+                return false;
+            }
+            static const auto rdata = REL::Module::get().segment(REL::Segment::rdata);
+            const auto vtable = *static_cast<const std::uintptr_t*>(object);
+            return vtable >= rdata.address() && vtable < rdata.address() + rdata.size();
+        }
+
         void scanSkins(HandState& state, RE::NiAVObject* object, int& logged, const int depth = 0) noexcept
         {
             if (!object || depth > 64) {
@@ -843,10 +876,12 @@ namespace
             if (auto* geometry = object->IsGeometry()) {
                 g_scanStage = "skin instance";
                 auto* skin = geometry->GetRuntimeData().skinInstance.get();
-                if (skin && skin->bonesData && skin->bonesCount > 0 && skin->bonesCount < 256) {
+                if (looksLikeGameObject(skin) && readable(skin, sizeof(RE::BSSkin::Instance)) && skin->bonesData &&
+                    skin->bonesCount > 0 && skin->bonesCount < 256 && readable(skin->bonesData, skin->bonesCount * sizeof(void*))) {
                     auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
                     auto** worlds = static_cast<RE::NiTransform**>(skin->boneWorldXformData);
-                    const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount;
+                    const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount &&
+                                             readable(worlds, skin->bonesCount * sizeof(void*));
                     std::uint32_t turned = 0, copies = 0, still = 0, foreign = 0;
                     char text[900]{};
                     int used = std::snprintf(text, sizeof(text), "  skin '%s' (%u bones):", object->GetName().data(), skin->bonesCount);
@@ -854,7 +889,7 @@ namespace
                         g_scanStage = "bone";
                         g_scanBone = index;
                         auto* bone = bones[index];
-                        if (!bone) {
+                        if (!looksLikeGameObject(bone) || !readable(bone, sizeof(RE::NiAVObject))) {
                             continue;
                         }
                         const std::string_view name = bone->GetName();
