@@ -683,7 +683,10 @@ namespace
                 return "Neck";
             }
             // Held by the hips, the body bends at the waist like at the shoulders.
-            if ((std::strcmp(bone, "Pelvis") == 0 || std::strcmp(bone, "SPINE1") == 0) && g_shoulderMovesBody) {
+            // Held by the chest or hips, the body bends at the waist.
+            if ((std::strcmp(bone, "Pelvis") == 0 || std::strcmp(bone, "SPINE1") == 0 || std::strcmp(bone, "SPINE2") == 0 ||
+                    std::strcmp(bone, "Chest") == 0) &&
+                g_shoulderMovesBody) {
                 return "SPINE1";
             }
             // A leg swings at the hip.
