@@ -1499,7 +1499,7 @@ namespace
             npctouch::reactions::initialize();
             npctouch::collision::initialize();
             npctouch::proxies::initialize();
-            loadGrabSettings();
+            proximity::loadGrabSettings();
             reactionsReady = true;
         }
         return true;
