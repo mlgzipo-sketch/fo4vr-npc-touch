@@ -600,9 +600,10 @@ namespace
             return r;
         }
 
-        // Recomputes world transforms below a node we moved, so the skin and
-        // the proxy capsules see the new pose this frame.
-        void updateChildren(RE::NiAVObject* object, const int depth = 0) noexcept
+        // Turns everything below a moved joint rigidly with it. The children's
+        // current world transforms are kept relative to the joint, so bones the
+        // game drives some other way (cloth, physics) do not jump.
+        void turnChildren(RE::NiAVObject* object, const RE::NiMatrix3& turn, const RE::NiPoint3& pivot, const int depth = 0) noexcept
         {
             auto* node = object ? object->IsNode() : nullptr;
             if (!node || depth > 32) {
@@ -614,11 +615,73 @@ namespace
                 if (!child) {
                     continue;
                 }
-                child->world.rotate = object->world.rotate * child->local.rotate;
-                child->world.translate = object->world.translate + object->world.rotate * (child->local.translate * object->world.scale);
-                child->world.scale = object->world.scale * child->local.scale;
-                updateChildren(child, depth + 1);
+                child->world.rotate = turn * child->world.rotate;
+                child->world.translate = pivot + turn * (child->world.translate - pivot);
+                turnChildren(child, turn, pivot, depth + 1);
             }
+        }
+
+        // Twist bones carry part of the arm's skin but can hang off the parent
+        // instead of the arm bone itself; turn the ones beside the joint too.
+        void turnTwistSiblings(RE::NiAVObject* joint, const RE::NiMatrix3& turn) noexcept
+        {
+            auto* parent = joint->parent;
+            if (!parent) {
+                return;
+            }
+            const auto jointName = joint->GetName();
+            if (jointName.size() < 5) {
+                return;
+            }
+            auto& siblings = parent->GetRuntimeData().children;
+            for (std::uint16_t index = 0; index < siblings.size(); ++index) {
+                auto* sibling = siblings[index].get();
+                if (!sibling || sibling == joint) {
+                    continue;
+                }
+                const auto name = sibling->GetName();
+                if (name.size() > 5 && std::strncmp(name.data(), jointName.data(), 5) == 0 && std::strstr(name.data(), "Twist")) {
+                    sibling->world.rotate = turn * sibling->world.rotate;
+                    sibling->world.translate = joint->world.translate + turn * (sibling->world.translate - joint->world.translate);
+                    if (auto* siblingParent = sibling->parent) {
+                        sibling->local.rotate = siblingParent->world.rotate.Transpose() * sibling->world.rotate;
+                    }
+                    turnChildren(sibling, turn, joint->world.translate);
+                }
+            }
+        }
+
+        // Logs, once, the bones around a joint we pose: helps when a pose looks wrong.
+        void describeJoint(RE::NiAVObject* joint) noexcept
+        {
+            static int described = 0;
+            if (!joint || described >= 4) {
+                return;
+            }
+            ++described;
+            char line[512]{};
+            int used = std::snprintf(line, sizeof(line), "Joint %s: parents", joint->GetName().data());
+            for (auto* up = joint->parent; up && used < 400; up = up->parent) {
+                used += std::snprintf(line + used, sizeof(line) - used, " < %s", up->GetName().data());
+            }
+            npctouch::runtime::logInfo(line);
+            auto listChildren = [&](RE::NiAVObject* object, const char* label) {
+                auto* node = object ? object->IsNode() : nullptr;
+                if (!node) {
+                    return;
+                }
+                char text[512]{};
+                int length = std::snprintf(text, sizeof(text), "  %s %s children:", label, object->GetName().data());
+                auto& children = node->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < children.size() && length < 480; ++index) {
+                    if (auto* child = children[index].get()) {
+                        length += std::snprintf(text + length, sizeof(text) - length, " %s", child->GetName().data());
+                    }
+                }
+                npctouch::runtime::logInfo(text);
+            };
+            listChildren(joint->parent, "parent");
+            listChildren(joint, "joint");
         }
 
         // Turns the joint so the grabbed point sits in the hand.
@@ -645,7 +708,8 @@ namespace
             ++state.posedFrames;
             joint->world.rotate = turn * joint->world.rotate;
             joint->local.rotate = parent->world.rotate.Transpose() * joint->world.rotate;
-            updateChildren(joint);
+            turnChildren(joint, turn, joint->world.translate);
+            turnTwistSiblings(joint, turn);
         }
 
         void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
@@ -701,6 +765,7 @@ namespace
             state.posedFrames = 0;
             state.keptFrames = 0;
             if (joint) {
+                describeJoint(joint);
                 const RE::NiPoint3 offset = state.position - joint->world.translate;
                 state.grabReach = length(offset);
                 state.grabLocal = joint->world.rotate.Transpose() * offset * (1.0f / joint->world.scale);
