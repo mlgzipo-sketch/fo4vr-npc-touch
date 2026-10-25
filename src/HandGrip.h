@@ -1,5 +1,7 @@
 #pragma once
 
+#include <RE/NetImmerse/NiTransform.h>
+
 namespace npctouch::grip
 {
     // Shapes the player's fingers around the NPC part a hand holds, through
@@ -9,6 +11,18 @@ namespace npctouch::grip
 
     // Gives the fingers back to FRIK.
     void release(bool left) noexcept;
+
+    // The tracked controller (wand) of a hand, as FRIK reads it this frame.
+    // False when FRIK is too old (API v2.3 needed) or not ready.
+    bool trackedHand(bool left, RE::NiTransform& out) noexcept;
+
+    // Draws the hand (and solves the arm) at this wrist transform instead of
+    // the controller, until unpinHand. Returns false if FRIK refused.
+    bool pinHand(bool left, const RE::NiTransform& wrist) noexcept;
+    void unpinHand(bool left) noexcept;
+
+    // Whether hands are pinned to what they hold (bPinHand).
+    bool pinEnabled() noexcept;
 
     // Reads the [Grab] grip keys of NpcTouch.ini.
     void loadSettings() noexcept;

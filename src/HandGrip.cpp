@@ -20,10 +20,13 @@ namespace npctouch::grip
         using frik::api::FRIKApiV2;
 
         constexpr const char* kTag = "NpcTouch_Grab";
-        // Above FRIK's own interaction poses (90), so the grip shows while held.
-        constexpr int kPriority = 95;
+        // Above FRIK's own poses (90) and ROCK's grab and contact claims (100).
+        constexpr int kPriority = 120;
 
         bool g_enabled{ true };
+        bool g_pinEnabled{ true };
+        bool g_pinned[2]{};
+        bool g_pinLogged{ false };
         float g_curlScale{ 1.0f };
         bool g_tried{ false };
         bool g_holding[2]{};
@@ -121,6 +124,47 @@ namespace npctouch::grip
         }
     }
 
+    bool trackedHand(const bool left, RE::NiTransform& out) noexcept
+    {
+        auto* frik = api();
+        if (!frik || frik->getVersion() < 3 || !frik->isSkeletonReady()) {
+            return false;
+        }
+        return frik->getTrackedHandTransform(frikHand(left), FRIKApiV2::TrackedHandKind::Wand, &out);
+    }
+
+    bool pinHand(const bool left, const RE::NiTransform& wrist) noexcept
+    {
+        auto* frik = api();
+        if (!g_pinEnabled || !frik || frik->getVersion() < 3 || !frik->isSkeletonReady()) {
+            return false;
+        }
+        const bool set = frik->setHandWorldTransform(kTag, frikHand(left), wrist, kPriority);
+        g_pinned[left ? 1 : 0] = set;
+        if (!g_pinLogged) {
+            g_pinLogged = true;
+            npctouch::runtime::logInfo(set ? "Hand grip: hand pinned to the held NPC" : "Hand grip: FRIK refused to pin the hand");
+        }
+        return set;
+    }
+
+    void unpinHand(const bool left) noexcept
+    {
+        const int index = left ? 1 : 0;
+        if (!g_pinned[index]) {
+            return;
+        }
+        g_pinned[index] = false;
+        if (auto* frik = api()) {
+            (void)frik->clearHandWorldTransform(kTag, frikHand(left));
+        }
+    }
+
+    bool pinEnabled() noexcept
+    {
+        return g_pinEnabled;
+    }
+
     void loadSettings() noexcept
     {
         try {
@@ -138,6 +182,8 @@ namespace npctouch::grip
                 const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                 if (key == "bShapeFingers") {
                     g_enabled = value != 0.0f;
+                } else if (key == "bPinHand") {
+                    g_pinEnabled = value != 0.0f;
                 } else if (key == "fFingerCurl") {
                     g_curlScale = std::clamp(value, 0.0f, 2.0f);
                 }

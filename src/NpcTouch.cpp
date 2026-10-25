@@ -144,11 +144,16 @@ namespace
 
     // ROCK's debug overlay only draws when ROCK's own debug view is on, so
     // also post the text as a regular game notification in the corner.
+    // The top-left game message on each touch and grab; bShowTouchMessages.
+    bool g_showMessages{ false };
+
     void showOverlay(const char* text) noexcept
     {
         std::snprintf(g_overlayText, sizeof(g_overlayText), "%s", text);
         g_overlayUntil = Clock::now() + kOverlayDuration;
-        RE::SendHUDMessage::ShowHUDMessage(g_overlayText, nullptr, false, false);
+        if (g_showMessages) {
+            RE::SendHUDMessage::ShowHUDMessage(g_overlayText, nullptr, false, false);
+        }
     }
 
     void handleTouchEvent(const collision::EventV1& event) noexcept
@@ -396,6 +401,16 @@ namespace
             Clock::time_point releaseStart{};
             RE::NiPoint3 releaseTarget{};
             std::uint32_t gripStatusLogged{ 0 };
+            // The hand frame ROCK reports (wrist, after ROCK's own hand authority).
+            RE::NiTransform wrist{};
+            // While a grab pins the visible hand to the NPC: the bone it rides
+            // on, the hand's pose in that bone's frame, and the wrist's pose in
+            // the tracked controller's frame (the limb follows the controller,
+            // since the visible hand no longer does).
+            bool pinned{ false };
+            RE::NiAVObject* pinBone{ nullptr };
+            RE::NiTransform pinLocal{};
+            RE::NiTransform wristInTracked{};
         };
 
         // OpenVR button id of the grip.
@@ -469,6 +484,13 @@ namespace
             }
             state.previous = state.position;
             state.position = position;
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    state.wrist.rotate.entry[row][column] = frame.transform.rotate[row * 3 + column];
+                }
+            }
+            state.wrist.translate = position;
+            state.wrist.scale = frame.transform.scale > 0.0f ? frame.transform.scale : 1.0f;
             state.previousTime = now;
             state.valid = true;
             return true;
@@ -599,6 +621,11 @@ namespace
         void endGrab(const rock::api::Hand hand, HandState& state, const char* reason) noexcept
         {
             npctouch::grip::release(hand == rock::api::Hand::Left);
+            if (state.pinned) {
+                npctouch::grip::unpinHand(hand == rock::api::Hand::Left);
+                state.pinned = false;
+                state.pinBone = nullptr;
+            }
             char message[200]{};
             std::snprintf(
                 message,
@@ -1468,6 +1495,8 @@ namespace
                         g_neckShare = std::clamp(value, 0.0f, 1.0f);
                     } else if (key == "bScanSkins") {
                         g_scanSkinsEnabled = value != 0.0f;
+                    } else if (key == "bShowTouchMessages") {
+                        g_showMessages = value != 0.0f;
                     } else if (key == "bFlinch") {
                         g_flinchEnabled = value != 0.0f;
                     } else if (key == "fFlinchFollow") {
@@ -1511,6 +1540,152 @@ namespace
                 g_flinchMaxHead,
                 g_flinchMaxArm);
             npctouch::runtime::logInfo(message);
+        }
+
+        // Transforms in the game's row convention: world = local * parent.
+        RE::NiTransform composeTransform(const RE::NiTransform& parent, const RE::NiTransform& local) noexcept
+        {
+            RE::NiTransform world{};
+            world.rotate = local.rotate * parent.rotate;
+            world.translate = parent.translate + parent.rotate.Transpose() * local.translate * parent.scale;
+            world.scale = local.scale * parent.scale;
+            return world;
+        }
+
+        RE::NiTransform relativeTransform(const RE::NiTransform& parent, const RE::NiTransform& world) noexcept
+        {
+            const float scale = parent.scale > 0.0f ? parent.scale : 1.0f;
+            RE::NiTransform local{};
+            local.rotate = world.rotate * parent.rotate.Transpose();
+            local.translate = parent.rotate * (world.translate - parent.translate) * (1.0f / scale);
+            local.scale = world.scale / scale;
+            return local;
+        }
+
+        // The limb a grabbed bone belongs to, as a segment and a radius: the
+        // palm is laid on its surface.
+        struct Limb
+        {
+            const char* from{ nullptr };
+            const char* to{ nullptr };
+            float radius{ 0.0f };
+        };
+
+        Limb limbFor(const char* bone) noexcept
+        {
+            if (!bone) {
+                return {};
+            }
+            const bool left = bone[0] == 'L';
+            if (std::strstr(bone, "_Hand")) {
+                return { left ? "LArm_ForeArm3" : "RArm_ForeArm3", bone, 3.0f };
+            }
+            if (std::strstr(bone, "ForeArm")) {
+                return { bone, left ? "LArm_Hand" : "RArm_Hand", 3.2f };
+            }
+            if (std::strstr(bone, "UpperArm")) {
+                return { bone, left ? "LArm_ForeArm1" : "RArm_ForeArm1", 4.5f };
+            }
+            if (std::strcmp(bone, "Neck") == 0) {
+                return { "Neck", "Head", 4.5f };
+            }
+            if (std::strcmp(bone, "Head") == 0) {
+                return { "Head", nullptr, 8.5f };
+            }
+            if (std::strcmp(bone, "Chest") == 0 || std::strcmp(bone, "SPINE2") == 0) {
+                return { "SPINE2", "Chest", 11.0f };
+            }
+            if (std::strcmp(bone, "SPINE1") == 0) {
+                return { "SPINE1", "SPINE2", 10.0f };
+            }
+            if (std::strcmp(bone, "Pelvis") == 0) {
+                return { "Pelvis", "SPINE1", 11.0f };
+            }
+            return {};
+        }
+
+        // At grab begin: turn the hand so the palm faces the limb and lay it on
+        // the limb's surface (within limits, so a bad guess cannot throw the
+        // hand around), then keep that pose in the grabbed bone's frame.
+        void setUpPin(HandState& state, const rock::api::Hand hand, RE::NiAVObject* root, const char* bone) noexcept
+        {
+            state.pinned = false;
+            state.pinBone = nullptr;
+            if (!npctouch::grip::pinEnabled() || !root || !bone) {
+                return;
+            }
+            const bool left = hand == rock::api::Hand::Left;
+            RE::NiTransform tracked{};
+            if (!npctouch::grip::trackedHand(left, tracked)) {
+                return;
+            }
+            auto* boneNode = findNode(root, bone);
+            const Limb limb = limbFor(bone);
+            auto* from = limb.from ? findNode(root, limb.from) : nullptr;
+            if (!boneNode || !from) {
+                return;
+            }
+            auto* to = limb.to ? findNode(root, limb.to) : nullptr;
+            const RE::NiTransform wrist = state.wrist;
+            const RE::NiPoint3 palmNormal = wrist.rotate.Transpose() * RE::NiPoint3{ 0.0f, 0.0f, -1.0f };
+            const RE::NiPoint3 fingers = wrist.rotate.Transpose() * RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
+            const RE::NiPoint3 palm = wrist.translate + fingers * (3.5f * wrist.scale) + palmNormal * wrist.scale;
+            // Closest point on the limb's axis to the palm.
+            RE::NiPoint3 axisPoint = from->world.translate;
+            if (to) {
+                const RE::NiPoint3 axis = to->world.translate - from->world.translate;
+                const float axisLength = dot(axis, axis);
+                if (axisLength > 1.0f) {
+                    const float along = std::clamp(dot(palm - from->world.translate, axis) / axisLength, 0.0f, 1.0f);
+                    axisPoint = from->world.translate + axis * along;
+                }
+            }
+            RE::NiTransform seated = wrist;
+            const RE::NiPoint3 out = palm - axisPoint;
+            const float gap = length(out);
+            float turned = 0.0f;
+            float moved = 0.0f;
+            if (gap > 0.5f) {
+                const RE::NiPoint3 outward = out * (1.0f / gap);
+                float angle{ 0.0f };
+                (void)rotationBetween(palmNormal, outward * -1.0f, angle);
+                constexpr float kMaxTurn = 1.2f;
+                const auto turn = rotationBetween(palmNormal, outward * -1.0f, angle, angle > kMaxTurn ? kMaxTurn / angle : 1.0f);
+                turned = std::min(angle, kMaxTurn);
+                seated.rotate = wrist.rotate * turn.Transpose();
+                seated.translate = palm + turn * (wrist.translate - palm);
+                RE::NiPoint3 shift = axisPoint + outward * (limb.radius + 1.0f) - palm;
+                moved = length(shift);
+                constexpr float kMaxShift = 8.0f;
+                if (moved > kMaxShift) {
+                    shift = shift * (kMaxShift / moved);
+                }
+                seated.translate = seated.translate + shift;
+            }
+            state.pinBone = boneNode;
+            state.pinLocal = relativeTransform(boneNode->world, seated);
+            state.wristInTracked = relativeTransform(tracked, wrist);
+            state.pinned = true;
+            char message[200]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "  hand pin on %s: palm %.1f from the limb axis (radius %.1f), turned %.0f deg, moved %.1f",
+                bone,
+                gap,
+                limb.radius,
+                turned * 57.3f,
+                moved);
+            npctouch::runtime::logInfo(message);
+        }
+
+        void unpin(const rock::api::Hand hand, HandState& state) noexcept
+        {
+            if (state.pinned) {
+                npctouch::grip::unpinHand(hand == rock::api::Hand::Left);
+            }
+            state.pinned = false;
+            state.pinBone = nullptr;
         }
 
         // Flinch: a touched NPC gives way. The touched part (upper body, head
@@ -1762,6 +1937,21 @@ namespace
                     endGrab(hand, state, "NPC gone");
                     return;
                 }
+                // A pinned hand is drawn on the NPC, so ROCK's hand frame sits
+                // there too; the limb follows the controller instead.
+                if (state.pinned) {
+                    RE::NiTransform tracked{};
+                    if (npctouch::grip::trackedHand(hand == rock::api::Hand::Left, tracked)) {
+                        state.position = composeTransform(tracked, state.wristInTracked).translate;
+                    }
+                    if (!state.releasing && state.pinBone) {
+                        const auto seated = composeTransform(state.pinBone->world, state.pinLocal);
+                        if (length(seated.translate - state.position) > kGrabBreak) {
+                            endGrab(hand, state, "slipped");
+                            return;
+                        }
+                    }
+                }
                 if (state.grabJoint) {
                     const RE::NiPoint3 reach = state.position - state.grabJoint->world.translate;
                     if (!state.releasing && length(reach) > state.grabReach + kGrabBreak) {
@@ -1772,8 +1962,12 @@ namespace
                 }
                 if (state.releasing) {
                     npctouch::grip::release(hand == rock::api::Hand::Left);
+                    unpin(hand, state);
                 } else {
                     npctouch::grip::hold(hand == rock::api::Hand::Left, state.grabbedBone);
+                    if (state.pinned && state.pinBone) {
+                        (void)npctouch::grip::pinHand(hand == rock::api::Hand::Left, composeTransform(state.pinBone->world, state.pinLocal));
+                    }
                 }
                 if (!state.releasing) {
                     const auto now = Clock::now();
@@ -1912,6 +2106,10 @@ namespace
                 state.grabLocal = joint->world.rotate * offset * (1.0f / joint->world.scale);
                 setUpElbow(state, hit.actor, root, joint, hit.bone);
             }
+            if (!joint) {
+                state.grabReach = 0.0f;
+            }
+            setUpPin(state, hand, root, hit.bone);
             state.lastHoldReaction = Clock::now();
             state.grabStart = state.lastHoldReaction;
             std::snprintf(
