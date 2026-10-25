@@ -22,6 +22,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -352,6 +354,14 @@ namespace
             RE::NiAVObject* skinBone{ nullptr };
             RE::NiTransform lastJointWorld{};
             RE::NiTransform lastSkinWorld{};
+            // Names of the bones a grab turns; worn clothing can carry copies.
+            std::vector<std::string> grabNames;
+            std::vector<RE::NiAVObject*> grabTurned;
+            std::uint32_t copiesTurned{ 0 };
+            // After the grip opens the limb eases back to the animation.
+            bool releasing{ false };
+            Clock::time_point releaseStart{};
+            RE::NiPoint3 releaseTarget{};
             std::uint32_t gripStatusLogged{ 0 };
         };
 
@@ -362,6 +372,8 @@ namespace
         // The grip slips when the hand gets this much further from the joint
         // than the grabbed point is.
         constexpr float kGrabBreak = 40.0f;
+        // How long a released limb takes to ease back to the animation.
+        constexpr float kReleaseSeconds = 0.35f;
 
         std::array<HandState, 2> g_handStates{};
 
@@ -541,16 +553,20 @@ namespace
             std::snprintf(
                 message,
                 sizeof(message),
-                "GRAB END: %s hand let go of %08X (%s), posed %u frames, pose kept by game %u",
+                "GRAB END: %s hand let go of %08X (%s), posed %u frames, pose kept by game %u, clothing bone copies turned %u",
                 handName(hand),
                 state.grabbedFormId,
                 reason,
                 state.posedFrames,
-                state.keptFrames);
+                state.keptFrames,
+                state.copiesTurned);
             npctouch::runtime::logInfo(message);
             state.grabbedFormId = 0;
             state.grabbedBone = nullptr;
             state.grabJoint = nullptr;
+            state.releasing = false;
+            state.grabNames.clear();
+            state.grabTurned.clear();
         }
 
         // The joint a grabbed bone turns around: arms at the shoulder, the head
@@ -577,8 +593,9 @@ namespace
             return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
         }
 
-        // Rotation (v' = R v) that turns unit vector a onto unit vector b.
-        RE::NiMatrix3 rotationBetween(const RE::NiPoint3& a, const RE::NiPoint3& b, float& angle) noexcept
+        // Rotation (v' = R v) that turns unit vector a onto unit vector b, or
+        // the given fraction of the way.
+        RE::NiMatrix3 rotationBetween(const RE::NiPoint3& a, const RE::NiPoint3& b, float& angle, const float fraction = 1.0f) noexcept
         {
             RE::NiPoint3 axis{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
             const float sine = length(axis);
@@ -590,17 +607,19 @@ namespace
                 return r;
             }
             axis = axis * (1.0f / sine);
-            const float t = 1.0f - cosine;
+            const float sn = std::sin(angle * fraction);
+            const float cs = std::cos(angle * fraction);
+            const float t = 1.0f - cs;
             const float x = axis.x, y = axis.y, z = axis.z;
-            r.entry[0][0] = cosine + x * x * t;
-            r.entry[0][1] = x * y * t - z * sine;
-            r.entry[0][2] = x * z * t + y * sine;
-            r.entry[1][0] = y * x * t + z * sine;
-            r.entry[1][1] = cosine + y * y * t;
-            r.entry[1][2] = y * z * t - x * sine;
-            r.entry[2][0] = z * x * t - y * sine;
-            r.entry[2][1] = z * y * t + x * sine;
-            r.entry[2][2] = cosine + z * z * t;
+            r.entry[0][0] = cs + x * x * t;
+            r.entry[0][1] = x * y * t - z * sn;
+            r.entry[0][2] = x * z * t + y * sn;
+            r.entry[1][0] = y * x * t + z * sn;
+            r.entry[1][1] = cs + y * y * t;
+            r.entry[1][2] = y * z * t - x * sn;
+            r.entry[2][0] = z * x * t - y * sn;
+            r.entry[2][1] = z * y * t + x * sn;
+            r.entry[2][2] = cs + z * z * t;
             return r;
         }
 
@@ -719,6 +738,66 @@ namespace
             return gap;
         }
 
+        void collectNames(RE::NiAVObject* object, std::vector<std::string>& names, const int depth = 0) noexcept
+        {
+            if (!object || depth > 32) {
+                return;
+            }
+            const auto name = object->GetName();
+            if (!name.empty()) {
+                names.emplace_back(name.data(), name.size());
+            }
+            if (auto* node = object->IsNode()) {
+                auto& children = node->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < children.size(); ++index) {
+                    collectNames(children[index].get(), names, depth + 1);
+                }
+            }
+        }
+
+        // Worn clothing and hats can carry their own copies of the skeleton's
+        // bones, synced from it before we pose. Turn those copies (and what
+        // hangs off them) the same way, skipping the skeleton bones already turned.
+        void turnCopies(
+            HandState& state,
+            RE::NiAVObject* object,
+            const RE::NiMatrix3& turn,
+            const RE::NiMatrix3& turnStored,
+            const RE::NiPoint3& pivot,
+            const bool inside,
+            const int depth = 0) noexcept
+        {
+            if (!object || depth > 64) {
+                return;
+            }
+            if (std::find(state.grabTurned.begin(), state.grabTurned.end(), object) != state.grabTurned.end()) {
+                return;
+            }
+            bool turnThis = inside;
+            if (!turnThis) {
+                const auto name = object->GetName();
+                for (const auto& wanted : state.grabNames) {
+                    if (wanted.size() == name.size() && _strnicmp(wanted.data(), name.data(), name.size()) == 0) {
+                        turnThis = true;
+                        break;
+                    }
+                }
+            }
+            if (turnThis) {
+                object->world.rotate = object->world.rotate * turnStored;
+                object->world.translate = pivot + turn * (object->world.translate - pivot);
+                if (!inside) {
+                    ++state.copiesTurned;
+                }
+            }
+            if (auto* node = object->IsNode()) {
+                auto& children = node->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < children.size(); ++index) {
+                    turnCopies(state, children[index].get(), turn, turnStored, pivot, turnThis, depth + 1);
+                }
+            }
+        }
+
         // Turns the joint so the grabbed point sits in the hand.
         void poseGrab(HandState& state, RE::NiAVObject* joint) noexcept
         {
@@ -727,14 +806,23 @@ namespace
                 return;
             }
             const RE::NiPoint3 current = joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
-            const RE::NiPoint3 wanted = state.position - joint->world.translate;
+            float fraction = 1.0f;
+            RE::NiPoint3 target = state.position;
+            if (state.releasing) {
+                target = state.releaseTarget;
+                fraction = 1.0f - std::chrono::duration<float>(Clock::now() - state.releaseStart).count() / kReleaseSeconds;
+                if (fraction <= 0.0f) {
+                    return;
+                }
+            }
+            const RE::NiPoint3 wanted = target - joint->world.translate;
             const float currentLength = length(current);
             const float wantedLength = length(wanted);
             if (currentLength < 1.0f || wantedLength < 1.0f) {
                 return;
             }
             float angle{ 0.0f };
-            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle);
+            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle, fraction);
             // If last frame's pose is still there, the game did not re-animate
             // the joint since; worth knowing for timing.
             if (angle < 0.02f) {
@@ -761,8 +849,12 @@ namespace
             const auto turnStored = turn.Transpose();
             joint->world.rotate = joint->world.rotate * turnStored;
             joint->local.rotate = joint->world.rotate * parent->world.rotate.Transpose();
-            turnChildren(joint, turn, turnStored, joint->world.translate);
+            const RE::NiPoint3 pivot = joint->world.translate;
+            turnChildren(joint, turn, turnStored, pivot);
             turnTwistSiblings(joint, turn, turnStored);
+            if (state.grabRoot) {
+                turnCopies(state, state.grabRoot, turn, turnStored, pivot, false);
+            }
             state.lastJointWorld = joint->world;
             if (state.skinBone) {
                 state.lastSkinWorld = state.skinBone->world;
@@ -775,9 +867,18 @@ namespace
             state.gripWasHeld = grip;
 
             if (state.grabbedFormId != 0) {
+                if (state.releasing && pressed) {
+                    endGrab(hand, state, "grabbed again");
+                } else if (!grip && !state.releasing) {
+                    state.releasing = true;
+                    state.releaseStart = Clock::now();
+                    state.releaseTarget = state.position;
+                }
+            }
+            if (state.grabbedFormId != 0) {
                 auto* actor = RE::TESForm::GetFormByID<RE::Actor>(state.grabbedFormId);
                 auto* root = actor ? actor->Get3D() : nullptr;
-                if (!grip) {
+                if (state.releasing && Clock::now() - state.releaseStart >= std::chrono::duration<float>(kReleaseSeconds)) {
                     endGrab(hand, state, "released");
                     return;
                 }
@@ -787,7 +888,7 @@ namespace
                 }
                 if (state.grabJoint) {
                     const RE::NiPoint3 reach = state.position - state.grabJoint->world.translate;
-                    if (length(reach) > state.grabReach + kGrabBreak) {
+                    if (!state.releasing && length(reach) > state.grabReach + kGrabBreak) {
                         endGrab(hand, state, "slipped");
                         return;
                     }
@@ -821,6 +922,27 @@ namespace
             state.grabJoint = joint;
             state.posedFrames = 0;
             state.keptFrames = 0;
+            state.copiesTurned = 0;
+            state.releasing = false;
+            state.grabNames.clear();
+            state.grabTurned.clear();
+            if (joint) {
+                collectNames(joint, state.grabNames);
+                state.grabTurned.push_back(joint);
+                if (auto* parent = joint->parent) {
+                    const auto jointName = joint->GetName();
+                    auto& siblings = parent->GetRuntimeData().children;
+                    for (std::uint16_t index = 0; index < siblings.size(); ++index) {
+                        auto* sibling = siblings[index].get();
+                        const auto name = sibling ? sibling->GetName() : RE::BSFixedString{};
+                        if (sibling && sibling != joint && name.size() > 5 && jointName.size() >= 5 &&
+                            std::strncmp(name.data(), jointName.data(), 5) == 0 && std::strstr(name.data(), "Twist")) {
+                            collectNames(sibling, state.grabNames);
+                            state.grabTurned.push_back(sibling);
+                        }
+                    }
+                }
+            }
             state.skinBone = nullptr;
             if (joint) {
                 describeJoint(joint);
