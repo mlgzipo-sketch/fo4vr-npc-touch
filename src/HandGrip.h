@@ -1,6 +1,9 @@
 #pragma once
 
-#include <RE/NetImmerse/NiTransform.h>
+namespace RE
+{
+    class NiTransform;
+}
 
 namespace npctouch::grip
 {
