@@ -70,7 +70,8 @@ namespace npctouch::grip
                     prox = 0.35f, mid = 0.4f, dist = 0.3f, thumb = 0.3f;
                 }
             }
-            const auto scaled = [](const float value) { return std::clamp(value * g_curlScale, 0.0f, 1.0f); };
+            // FRIK's finger values run from 0 (closed) to 1 (open).
+            const auto scaled = [](const float curl) { return 1.0f - std::clamp(curl * g_curlScale, 0.0f, 1.0f); };
             FRIKApiV2::HandPoseData pose{};
             pose.thumb = { scaled(thumb), scaled(thumb), scaled(thumb * 0.8f), 0.0f };
             pose.index = { scaled(prox * 0.9f), scaled(mid * 0.9f), scaled(dist * 0.9f), 0.0f };

@@ -388,6 +388,7 @@ namespace
             // stretches less.
             RE::NiAVObject* grabCollar{ nullptr };
             RE::NiAVObject* grabHead{ nullptr };
+            bool grabTorso{ false };  // a shoulder grab sways the upper body
             // For the skin scan log: unskinned meshes near this point are listed.
             RE::NiPoint3 scanNear{};
             bool scanNearValid{ false };
@@ -429,12 +430,15 @@ namespace
         bool g_scanSkinsEnabled{ true };
         float g_collarShare{ 0.3f };
         float g_neckShare{ 0.5f };
+        bool g_shoulderMovesBody{ true };
+        float g_torsoGrabMax{ 0.45f };  // radians the upper body turns at most
         // Flinch settings (see the [Flinch] section of the ini).
         bool g_flinchEnabled{ true };
         float g_flinchFollow{ 0.7f };      // share of the hand's motion the body takes
         float g_flinchStiffness{ 9.0f };   // spring frequency back to the animation, rad/s
         float g_flinchDamping{ 0.55f };    // damping ratio of that spring
         float g_flinchMinSpeed{ 20.0f };   // slower hands only touch
+        float g_flinchMinSpeedArm{ 70.0f };  // arms need a real hit
         float g_flinchMaxTorso{ 0.25f };
         float g_flinchMaxHead{ 0.5f };
         float g_flinchMaxArm{ 0.7f };
@@ -657,6 +661,11 @@ namespace
         {
             if (!bone) {
                 return nullptr;
+            }
+            // Held by the shoulder, the whole upper body sways; held lower,
+            // the arm moves.
+            if (std::strstr(bone, "_UpperArm") && g_shoulderMovesBody) {
+                return "SPINE2";
             }
             if (std::strncmp(bone, "LArm_", 5) == 0) {
                 return "LArm_UpperArm";
@@ -1381,7 +1390,14 @@ namespace
             float angle{ 0.0f };
             // A head grab turns the neck only part of the way; the head does the rest.
             const float jointShare = state.grabHead ? std::clamp(g_neckShare, 0.0f, 1.0f) : 1.0f;
-            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle, fraction * jointShare);
+            float share = fraction * jointShare;
+            if (state.grabTorso) {
+                (void)rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle);
+                if (angle * share > g_torsoGrabMax && angle > 0.0f) {
+                    share = g_torsoGrabMax / angle;
+                }
+            }
+            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle, share);
             // If last frame's pose is still there, the game did not re-animate
             // the joint since; worth knowing for timing.
             if (angle < 0.02f) {
@@ -1495,6 +1511,10 @@ namespace
                         g_neckShare = std::clamp(value, 0.0f, 1.0f);
                     } else if (key == "bScanSkins") {
                         g_scanSkinsEnabled = value != 0.0f;
+                    } else if (key == "bShoulderMovesBody") {
+                        g_shoulderMovesBody = value != 0.0f;
+                    } else if (key == "fTorsoGrabMax") {
+                        g_torsoGrabMax = std::clamp(value, 0.05f, 1.2f);
                     } else if (key == "bShowTouchMessages") {
                         g_showMessages = value != 0.0f;
                     } else if (key == "bFlinch") {
@@ -1507,6 +1527,8 @@ namespace
                         g_flinchDamping = std::clamp(value, 0.05f, 2.0f);
                     } else if (key == "fFlinchMinSpeed") {
                         g_flinchMinSpeed = std::max(value, 0.0f);
+                    } else if (key == "fFlinchMinSpeedArm") {
+                        g_flinchMinSpeedArm = std::max(value, 0.0f);
                     } else if (key == "fFlinchMaxTorso") {
                         g_flinchMaxTorso = std::clamp(value, 0.0f, 1.0f);
                     } else if (key == "fFlinchMaxHead") {
@@ -1627,9 +1649,10 @@ namespace
             }
             auto* to = limb.to ? findNode(root, limb.to) : nullptr;
             const RE::NiTransform wrist = state.wrist;
-            const RE::NiPoint3 palmNormal = wrist.rotate.Transpose() * RE::NiPoint3{ 0.0f, 0.0f, -1.0f };
-            const RE::NiPoint3 fingers = wrist.rotate.Transpose() * RE::NiPoint3{ 1.0f, 0.0f, 0.0f };
-            const RE::NiPoint3 palm = wrist.translate + fingers * (3.5f * wrist.scale) + palmNormal * wrist.scale;
+            // ROCK's hand space: +X along the fingers, -Y out of the palm; the
+            // palm's middle sits 6 along the fingers and 2 toward the palm face.
+            const RE::NiPoint3 palmNormal = wrist.rotate.Transpose() * RE::NiPoint3{ 0.0f, -1.0f, 0.0f };
+            const RE::NiPoint3 palm = wrist.translate + wrist.rotate.Transpose() * RE::NiPoint3{ 6.0f, -2.0f, 0.0f } * wrist.scale;
             // Closest point on the limb's axis to the palm.
             RE::NiPoint3 axisPoint = from->world.translate;
             if (to) {
@@ -1649,7 +1672,7 @@ namespace
                 const RE::NiPoint3 outward = out * (1.0f / gap);
                 float angle{ 0.0f };
                 (void)rotationBetween(palmNormal, outward * -1.0f, angle);
-                constexpr float kMaxTurn = 1.2f;
+                constexpr float kMaxTurn = 0.8f;
                 const auto turn = rotationBetween(palmNormal, outward * -1.0f, angle, angle > kMaxTurn ? kMaxTurn / angle : 1.0f);
                 turned = std::min(angle, kMaxTurn);
                 seated.rotate = wrist.rotate * turn.Transpose();
@@ -1796,6 +1819,12 @@ namespace
             }
             float maxAngle{ 0.0f };
             const char* jointName = flinchJoint(hit.bone, maxAngle);
+            // An arm only gives way to a real hit, so a hand reaching for it
+            // slowly does not push it away.
+            const bool arm = jointName && std::strstr(jointName, "UpperArm");
+            if (arm && length(velocity) < g_flinchMinSpeedArm) {
+                return;
+            }
             auto* root = jointName ? hit.actor->Get3D() : nullptr;
             auto* joint = root ? findNode(root, jointName) : nullptr;
             if (!joint || maxAngle <= 0.0f) {
@@ -2042,12 +2071,14 @@ namespace
             state.grabCopies.clear();
             state.grabCollar = nullptr;
             state.grabHead = nullptr;
+            state.grabTorso = false;
             state.scanNearValid = false;
             if (joint) {
                 const std::string_view name = joint->GetName();
                 if (name.find("UpperArm") != std::string_view::npos && joint->parent && g_collarShare > 0.0f) {
                     state.grabCollar = joint->parent;
                 }
+                state.grabTorso = name == "SPINE2";
                 if (name == "Neck") {
                     if (auto* head = findNode(joint, "Head")) {
                         state.scanNear = head->world.translate;
