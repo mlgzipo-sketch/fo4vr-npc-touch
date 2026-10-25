@@ -1821,8 +1821,8 @@ namespace
             const char* jointName = flinchJoint(hit.bone, maxAngle);
             // An arm only gives way to a real hit, so a hand reaching for it
             // slowly does not push it away.
-            const bool arm = jointName && std::strstr(jointName, "UpperArm");
-            if (arm && length(velocity) < g_flinchMinSpeedArm) {
+            const bool armJoint = jointName && std::strstr(jointName, "UpperArm");
+            if (armJoint && length(velocity) < g_flinchMinSpeedArm) {
                 return;
             }
             auto* root = jointName ? hit.actor->Get3D() : nullptr;
