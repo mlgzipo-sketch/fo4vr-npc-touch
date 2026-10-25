@@ -2221,6 +2221,66 @@ namespace
             npctouch::reactions::onTouch(hit.actor, hit.bone, still);
         }
 
+        // Where ROCK's hand and the visible hand sit relative to the controller.
+        // Both offsets stay constant unless something holds a hand away from
+        // the controller, so a lasting change shows a drifted hand.
+        struct DriftLog
+        {
+            Clock::time_point last{};
+            float authority{ -1.0f };
+            float presented{ -1.0f };
+        };
+        std::array<DriftLog, 2> g_driftLogs{};
+
+        void logHandDrift(const std::uint64_t ownerToken, const rock::api::Hand hand, const HandState& state) noexcept
+        {
+            const bool left = hand == rock::api::Hand::Left;
+            RE::NiTransform tracked{};
+            if (!npctouch::grip::trackedHand(left, tracked)) {
+                return;
+            }
+            const auto offsetOf = [&](const RE::NiPoint3& point) {
+                const RE::NiPoint3 local = tracked.rotate * (point - tracked.translate);
+                return local;
+            };
+            const RE::NiPoint3 authority = offsetOf(state.position);
+            float presentedLength = -1.0f;
+            RE::NiPoint3 presented{};
+            hands::HandFrameV1 frame{};
+            if (g_hands->getPresentedHandFrameV1 && g_hands->getPresentedHandFrameV1(ownerToken, hand, &frame) == rock::api::Status::Ok &&
+                (frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) != 0) {
+                presented = offsetOf(RE::NiPoint3{ frame.transform.translate[0], frame.transform.translate[1], frame.transform.translate[2] });
+                presentedLength = std::sqrt(presented.x * presented.x + presented.y * presented.y + presented.z * presented.z);
+            }
+            const float authorityLength = std::sqrt(authority.x * authority.x + authority.y * authority.y + authority.z * authority.z);
+            auto& log = g_driftLogs[left ? 1 : 0];
+            const auto now = Clock::now();
+            const bool changed = log.authority < 0.0f || std::abs(authorityLength - log.authority) > 4.0f ||
+                                 std::abs(presentedLength - log.presented) > 4.0f;
+            if (now - log.last < std::chrono::seconds(changed ? 1 : 10)) {
+                return;
+            }
+            log.last = now;
+            log.authority = authorityLength;
+            log.presented = presentedLength;
+            char message[240]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "hand drift %s: ROCK hand %.1f from controller (%.1f, %.1f, %.1f), visible %.1f (%.1f, %.1f, %.1f)%s",
+                handName(hand),
+                authorityLength,
+                authority.x,
+                authority.y,
+                authority.z,
+                presentedLength,
+                presented.x,
+                presented.y,
+                presented.z,
+                state.grabbedFormId != 0 ? " grabbing" : (state.touchedFormId != 0 ? " touching" : ""));
+            npctouch::runtime::logInfo(message);
+        }
+
         void update(const std::uint64_t ownerToken) noexcept
         {
             auto* player = RE::PlayerCharacter::GetSingleton();
@@ -2233,6 +2293,7 @@ namespace
                 if (!readHand(ownerToken, handIds[index], state)) {
                     continue;
                 }
+                logHandDrift(ownerToken, handIds[index], state);
                 g_diag.nearbyActors = 0;
                 const auto hit = nearestBone(state.position, player);
                 auto& diag = g_diag.hand[index];
