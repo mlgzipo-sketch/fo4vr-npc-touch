@@ -359,6 +359,8 @@ namespace
             std::vector<std::string> grabNames;
             std::vector<RE::NiAVObject*> grabTurned;
             std::uint32_t copiesTurned{ 0 };
+            // Bones that worn skins bind to outside the skeleton, turned by hand.
+            std::vector<RE::NiAVObject*> grabCopies;
             // After the grip opens the limb eases back to the animation.
             bool releasing{ false };
             Clock::time_point releaseStart{};
@@ -568,6 +570,7 @@ namespace
             state.releasing = false;
             state.grabNames.clear();
             state.grabTurned.clear();
+            state.grabCopies.clear();
         }
 
         // The joint a grabbed bone turns around: arms at the shoulder, the head
@@ -756,6 +759,94 @@ namespace
             }
         }
 
+        bool turnedByGrab(const HandState& state, RE::NiAVObject* bone) noexcept
+        {
+            for (auto* up = bone; up; up = up->parent) {
+                if (std::find(state.grabTurned.begin(), state.grabTurned.end(), up) != state.grabTurned.end()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool namedLikeGrab(const HandState& state, const std::string_view name) noexcept
+        {
+            for (const auto& wanted : state.grabNames) {
+                if (wanted.size() == name.size() && _strnicmp(wanted.data(), name.data(), name.size()) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Skinned meshes (body, outfit, hat) bind to bone nodes through their
+        // skin instance. Log every mesh that binds both to bones the grab turns
+        // and to bones it leaves alone, since such a mesh stretches. Bones named
+        // like a turned bone that sit outside the skeleton are copies; keep them
+        // so the pose turns them too.
+        void scanSkins(HandState& state, RE::NiAVObject* object, int& logged, const int depth = 0) noexcept
+        {
+            if (!object || depth > 64) {
+                return;
+            }
+            if (auto* geometry = object->IsGeometry()) {
+                auto* skin = geometry->GetRuntimeData().skinInstance.get();
+                if (skin && skin->bonesData && skin->bonesCount > 0 && skin->bonesCount < 256) {
+                    auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
+                    auto** worlds = static_cast<RE::NiTransform**>(skin->boneWorldXformData);
+                    const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount;
+                    std::uint32_t turned = 0, copies = 0, still = 0, foreign = 0;
+                    char text[900]{};
+                    int used = std::snprintf(text, sizeof(text), "  skin '%s' (%u bones):", object->GetName().data(), skin->bonesCount);
+                    for (std::uint32_t index = 0; index < skin->bonesCount; ++index) {
+                        auto* bone = bones[index];
+                        if (!bone) {
+                            continue;
+                        }
+                        const std::string_view name = bone->GetName();
+                        char mark = '-';
+                        if (turnedByGrab(state, bone)) {
+                            mark = 'T';
+                            ++turned;
+                        } else if (namedLikeGrab(state, name)) {
+                            mark = 'C';
+                            ++copies;
+                            if (std::find(state.grabCopies.begin(), state.grabCopies.end(), bone) == state.grabCopies.end()) {
+                                state.grabCopies.push_back(bone);
+                            }
+                        } else {
+                            ++still;
+                        }
+                        if (worldsMatch && worlds[index] != &bone->world) {
+                            ++foreign;
+                        }
+                        if (mark != '-' || used < 700) {
+                            used += std::snprintf(
+                                text + used,
+                                sizeof(text) - used,
+                                " %.*s[%c<%s]",
+                                static_cast<int>(name.size()),
+                                name.data(),
+                                mark,
+                                bone->parent ? bone->parent->GetName().data() : "-");
+                            used = std::min(used, static_cast<int>(sizeof(text)) - 1);
+                        }
+                    }
+                    if ((turned + copies) > 0 && still > 0 && logged < 24) {
+                        std::snprintf(text + used, sizeof(text) - used, " | world ptrs not on bone %u", foreign);
+                        npctouch::runtime::logInfo(text);
+                        ++logged;
+                    }
+                }
+            }
+            if (auto* node = object->IsNode()) {
+                auto& children = node->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < children.size(); ++index) {
+                    scanSkins(state, children[index].get(), logged, depth + 1);
+                }
+            }
+        }
+
         // Worn clothing and hats can carry their own copies of the skeleton's
         // bones, synced from it before we pose. Turn those copies (and what
         // hangs off them) the same way, skipping the skeleton bones already turned.
@@ -774,8 +865,10 @@ namespace
             if (std::find(state.grabTurned.begin(), state.grabTurned.end(), object) != state.grabTurned.end()) {
                 return;
             }
-            bool turnThis = inside;
-            if (!turnThis) {
+            // Skin bone copies are turned on their own after this walk.
+            const bool skinCopy = std::find(state.grabCopies.begin(), state.grabCopies.end(), object) != state.grabCopies.end();
+            bool turnThis = inside && !skinCopy;
+            if (!turnThis && !skinCopy) {
                 const auto name = object->GetName();
                 for (const auto& wanted : state.grabNames) {
                     if (wanted.size() == name.size() && _strnicmp(wanted.data(), name.data(), name.size()) == 0) {
@@ -855,6 +948,11 @@ namespace
             turnTwistSiblings(joint, turn, turnStored);
             if (state.grabRoot) {
                 turnCopies(state, state.grabRoot, turn, turnStored, pivot, false);
+            }
+            for (auto* copy : state.grabCopies) {
+                copy->world.rotate = copy->world.rotate * turnStored;
+                copy->world.translate = pivot + turn * (copy->world.translate - pivot);
+                ++state.copiesTurned;
             }
             state.lastJointWorld = joint->world;
             if (state.skinBone) {
@@ -948,6 +1046,14 @@ namespace
                 }
             }
             state.skinBone = nullptr;
+            state.grabCopies.clear();
+            if (joint && root) {
+                int logged = 0;
+                scanSkins(state, root, logged);
+                char text[160]{};
+                std::snprintf(text, sizeof(text), "  skins: %d meshes bind across the turned bones, %zu bone copies found", logged, state.grabCopies.size());
+                npctouch::runtime::logInfo(text);
+            }
             if (joint) {
                 describeJoint(joint);
                 if (auto* node = joint->IsNode()) {
