@@ -784,12 +784,22 @@ namespace
         // and to bones it leaves alone, since such a mesh stretches. Bones named
         // like a turned bone that sit outside the skeleton are copies; keep them
         // so the pose turns them too.
+        // Where the skin scan was when it last touched game memory, for the
+        // fault log.
+        const char* g_scanStage = "";
+        const RE::NiAVObject* g_scanObject = nullptr;
+        std::uint32_t g_scanBone = 0;
+        bool g_scanBroken = false;
+
         void scanSkins(HandState& state, RE::NiAVObject* object, int& logged, const int depth = 0) noexcept
         {
             if (!object || depth > 64) {
                 return;
             }
+            g_scanObject = object;
+            g_scanStage = "geometry";
             if (auto* geometry = object->IsGeometry()) {
+                g_scanStage = "skin instance";
                 auto* skin = geometry->GetRuntimeData().skinInstance.get();
                 if (skin && skin->bonesData && skin->bonesCount > 0 && skin->bonesCount < 256) {
                     auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
@@ -799,6 +809,8 @@ namespace
                     char text[900]{};
                     int used = std::snprintf(text, sizeof(text), "  skin '%s' (%u bones):", object->GetName().data(), skin->bonesCount);
                     for (std::uint32_t index = 0; index < skin->bonesCount; ++index) {
+                        g_scanStage = "bone";
+                        g_scanBone = index;
                         auto* bone = bones[index];
                         if (!bone) {
                             continue;
@@ -839,11 +851,25 @@ namespace
                     }
                 }
             }
+            g_scanObject = object;
+            g_scanStage = "children";
             if (auto* node = object->IsNode()) {
                 auto& children = node->GetRuntimeData().children;
                 for (std::uint16_t index = 0; index < children.size(); ++index) {
                     scanSkins(state, children[index].get(), logged, depth + 1);
                 }
+            }
+        }
+
+        // The skin instance layout comes from reverse engineering, so a wrong
+        // offset must only turn the scan off, not the whole plugin.
+        bool tryScanSkins(HandState& state, RE::NiAVObject* root, int& logged) noexcept
+        {
+            __try {
+                scanSkins(state, root, logged);
+                return true;
+            } __except (1) {
+                return false;
             }
         }
 
@@ -1047,11 +1073,22 @@ namespace
             }
             state.skinBone = nullptr;
             state.grabCopies.clear();
-            if (joint && root) {
+            if (joint && root && !g_scanBroken) {
                 int logged = 0;
-                scanSkins(state, root, logged);
-                char text[160]{};
-                std::snprintf(text, sizeof(text), "  skins: %d meshes bind across the turned bones, %zu bone copies found", logged, state.grabCopies.size());
+                char text[200]{};
+                if (tryScanSkins(state, root, logged)) {
+                    std::snprintf(text, sizeof(text), "  skins: %d meshes bind across the turned bones, %zu bone copies found", logged, state.grabCopies.size());
+                } else {
+                    g_scanBroken = true;
+                    state.grabCopies.clear();
+                    std::snprintf(
+                        text,
+                        sizeof(text),
+                        "  skin scan faulted at %s (object %p, bone %u); scan off until restart",
+                        g_scanStage,
+                        static_cast<const void*>(g_scanObject),
+                        g_scanBone);
+                }
                 npctouch::runtime::logInfo(text);
             }
             if (joint) {
