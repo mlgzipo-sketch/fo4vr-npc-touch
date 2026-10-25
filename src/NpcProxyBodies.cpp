@@ -142,6 +142,11 @@ namespace npctouch::proxies
             RE::NiAVObject* from{ nullptr };
             RE::NiAVObject* to{ nullptr };
             RE::NiAVObject* parent{ nullptr };
+            // The head's capsule runs up from the head bone in the head's own
+            // frame (world up when the body was made), so it turns with the
+            // head; along the neck it would lean forward onto the face.
+            bool upright{ false };
+            RE::NiPoint3 upLocal{};
         };
 
         struct Proxy
@@ -581,6 +586,10 @@ namespace npctouch::proxies
             bones.from = findNode(root, segment.from);
             bones.to = segment.to ? findNode(root, segment.to) : nullptr;
             bones.parent = segment.parent ? findNode(root, segment.parent) : nullptr;
+            bones.upright = bones.from && std::strcmp(segment.name, "head") == 0;
+            if (bones.upright) {
+                bones.upLocal = bones.from->world.rotate * RE::NiPoint3{ 0.0f, 0.0f, 1.0f };
+            }
             return bones.from && (segment.to ? bones.to != nullptr : bones.parent != nullptr);
         }
 
@@ -592,6 +601,8 @@ namespace npctouch::proxies
             RE::NiPoint3 end{};
             if (bones.to) {
                 end = bones.to->world.translate;
+            } else if (bones.upright) {
+                end = start + bones.from->world.rotate.Transpose() * bones.upLocal * segment.extend;
             } else {
                 RE::NiPoint3 direction = start - bones.parent->world.translate;
                 const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
