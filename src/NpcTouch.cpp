@@ -607,7 +607,7 @@ namespace
         // Turns everything below a moved joint rigidly with it. The children's
         // current world transforms are kept relative to the joint, so bones the
         // game drives some other way (cloth, physics) do not jump.
-        void turnChildren(RE::NiAVObject* object, const RE::NiMatrix3& turn, const RE::NiPoint3& pivot, const int depth = 0) noexcept
+        void turnChildren(RE::NiAVObject* object, const RE::NiMatrix3& turn, const RE::NiMatrix3& turnStored, const RE::NiPoint3& pivot, const int depth = 0) noexcept
         {
             auto* node = object ? object->IsNode() : nullptr;
             if (!node || depth > 32) {
@@ -619,15 +619,15 @@ namespace
                 if (!child) {
                     continue;
                 }
-                child->world.rotate = turn * child->world.rotate;
+                child->world.rotate = child->world.rotate * turnStored;
                 child->world.translate = pivot + turn * (child->world.translate - pivot);
-                turnChildren(child, turn, pivot, depth + 1);
+                turnChildren(child, turn, turnStored, pivot, depth + 1);
             }
         }
 
         // Twist bones carry part of the arm's skin but can hang off the parent
         // instead of the arm bone itself; turn the ones beside the joint too.
-        void turnTwistSiblings(RE::NiAVObject* joint, const RE::NiMatrix3& turn) noexcept
+        void turnTwistSiblings(RE::NiAVObject* joint, const RE::NiMatrix3& turn, const RE::NiMatrix3& turnStored) noexcept
         {
             auto* parent = joint->parent;
             if (!parent) {
@@ -645,12 +645,12 @@ namespace
                 }
                 const auto name = sibling->GetName();
                 if (name.size() > 5 && std::strncmp(name.data(), jointName.data(), 5) == 0 && std::strstr(name.data(), "Twist")) {
-                    sibling->world.rotate = turn * sibling->world.rotate;
+                    sibling->world.rotate = sibling->world.rotate * turnStored;
                     sibling->world.translate = joint->world.translate + turn * (sibling->world.translate - joint->world.translate);
                     if (auto* siblingParent = sibling->parent) {
-                        sibling->local.rotate = siblingParent->world.rotate.Transpose() * sibling->world.rotate;
+                        sibling->local.rotate = sibling->world.rotate * siblingParent->world.rotate.Transpose();
                     }
-                    turnChildren(sibling, turn, joint->world.translate);
+                    turnChildren(sibling, turn, turnStored, joint->world.translate);
                 }
             }
         }
@@ -697,14 +697,14 @@ namespace
             if (!parent) {
                 return;
             }
-            const auto expected = parent->world.rotate * object->local.rotate;
+            const auto expected = object->local.rotate * parent->world.rotate;
             rotation = 0.0f;
             for (int row = 0; row < 3; ++row) {
                 for (int column = 0; column < 3; ++column) {
                     rotation = std::max(rotation, std::abs(expected.entry[row][column] - object->world.rotate.entry[row][column]));
                 }
             }
-            const auto expectedTranslate = parent->world.translate + parent->world.rotate * (object->local.translate * parent->world.scale);
+            const auto expectedTranslate = parent->world.translate + parent->world.rotate.Transpose() * (object->local.translate * parent->world.scale);
             translation = length(expectedTranslate - object->world.translate);
         }
 
@@ -726,7 +726,7 @@ namespace
             if (!parent) {
                 return;
             }
-            const RE::NiPoint3 current = joint->world.rotate * state.grabLocal * joint->world.scale;
+            const RE::NiPoint3 current = joint->world.rotate.Transpose() * state.grabLocal * joint->world.scale;
             const RE::NiPoint3 wanted = state.position - joint->world.translate;
             const float currentLength = length(current);
             const float wantedLength = length(wanted);
@@ -756,10 +756,13 @@ namespace
                 npctouch::runtime::logInfo(message);
             }
             ++state.posedFrames;
-            joint->world.rotate = turn * joint->world.rotate;
-            joint->local.rotate = parent->world.rotate.Transpose() * joint->world.rotate;
-            turnChildren(joint, turn, joint->world.translate);
-            turnTwistSiblings(joint, turn);
+            // Game matrices map world vectors into the node's frame
+            // (world = R^T * local), so a world turn T becomes R * T^T.
+            const auto turnStored = turn.Transpose();
+            joint->world.rotate = joint->world.rotate * turnStored;
+            joint->local.rotate = joint->world.rotate * parent->world.rotate.Transpose();
+            turnChildren(joint, turn, turnStored, joint->world.translate);
+            turnTwistSiblings(joint, turn, turnStored);
             state.lastJointWorld = joint->world;
             if (state.skinBone) {
                 state.lastSkinWorld = state.skinBone->world;
@@ -844,7 +847,7 @@ namespace
                 }
                 const RE::NiPoint3 offset = state.position - joint->world.translate;
                 state.grabReach = length(offset);
-                state.grabLocal = joint->world.rotate.Transpose() * offset * (1.0f / joint->world.scale);
+                state.grabLocal = joint->world.rotate * offset * (1.0f / joint->world.scale);
             }
             std::snprintf(
                 message,
