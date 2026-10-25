@@ -331,6 +331,16 @@ namespace
         constexpr float kHandReach = 6.0f;
         constexpr float kReleaseMargin = 4.0f;
 
+        // A skin's bone transform slot that the grab moves by hand, kept at a
+        // fixed offset from a node the grab turns.
+        struct SkinLink
+        {
+            RE::NiTransform* slot{ nullptr };
+            RE::NiAVObject* node{ nullptr };
+            RE::NiMatrix3 rotate{};
+            RE::NiPoint3 translate{};
+        };
+
         struct HandState
         {
             bool valid{ false };
@@ -362,6 +372,9 @@ namespace
             std::uint32_t copiesTurned{ 0 };
             // Bones that worn skins bind to outside the skeleton, turned by hand.
             std::vector<RE::NiAVObject*> grabCopies;
+            std::vector<SkinLink> skinLinks;
+            // Every node of the grabbed actor, while the skin scan runs.
+            std::vector<RE::NiAVObject*> scanNodes;
             // Arm grabs below the elbow also bend the elbow (two-bone reach).
             RE::NiAVObject* grabElbow{ nullptr };
             // A share of an arm grab turns the collarbone, a share of a head
@@ -594,6 +607,7 @@ namespace
             state.grabNames.clear();
             state.grabTurned.clear();
             state.grabCopies.clear();
+            state.skinLinks.clear();
             state.grabElbow = nullptr;
             state.grabCollar = nullptr;
             state.grabHead = nullptr;
@@ -845,7 +859,6 @@ namespace
         const char* g_scanStage = "";
         const RE::NiAVObject* g_scanObject = nullptr;
         std::uint32_t g_scanBone = 0;
-        bool g_scanBroken = false;
 
         // ROCK treats any fault inside our frame callback as fatal before our own
         // SEH handlers run, so raw pointers from the skin data are checked
@@ -880,116 +893,289 @@ namespace
             return vtable >= rdata.address() && vtable < rdata.address() + rdata.size();
         }
 
-        void scanSkins(HandState& state, RE::NiAVObject* object, int& logged, const int depth = 0) noexcept
+        bool writable(const void* address, const std::size_t size) noexcept
         {
-            if (!object || depth > 64) {
+            if (!readable(address, size)) {
+                return false;
+            }
+            REX::W32::MEMORY_BASIC_INFORMATION info{};
+            REX::W32::VirtualQuery(address, &info, sizeof(info));
+            constexpr std::uint32_t writableMask = REX::W32::PAGE_READWRITE | REX::W32::PAGE_WRITECOPY | REX::W32::PAGE_EXECUTE_READWRITE;
+            return (info.protect & writableMask) != 0;
+        }
+
+        // A bone name, or "?" when the object or its name cannot be read.
+        std::string_view safeName(const RE::NiAVObject* object) noexcept
+        {
+            if (!looksLikeGameObject(object) || !readable(object, sizeof(RE::NiAVObject))) {
+                return "?";
+            }
+            const char* text = object->GetName().data();
+            if (!text || !readable(text, 1)) {
+                return "?";
+            }
+            std::size_t size = 0;
+            while (size < 64 && readable(text + size, 1) && text[size] != '\0') {
+                ++size;
+            }
+            return { text, size };
+        }
+
+        // Bones worth naming in the log when a skin stretches: same arm, or head area.
+        bool relevantToGrab(const HandState& state, const std::string_view name) noexcept
+        {
+            if (state.grabHead || state.scanNearValid) {
+                for (const char* word : { "Head", "Neck", "Hat", "HAT", "Hair", "Helm", "Face", "Jaw", "Eye" }) {
+                    if (name.find(word) != std::string_view::npos) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return name.size() > 4 && !state.grabNames.empty() && state.grabNames.front().size() > 4 &&
+                   _strnicmp(name.data(), state.grabNames.front().data(), 4) == 0;
+        }
+
+        // The node of the actor nearest to a point; for a skin slot whose bone
+        // pointer cannot be read.
+        RE::NiAVObject* nearestNode(const HandState& state, const RE::NiPoint3& point, float& distance) noexcept
+        {
+            RE::NiAVObject* best = nullptr;
+            distance = 1.0e9f;
+            for (auto* node : state.scanNodes) {
+                const float gap = length(node->world.translate - point);
+                if (gap < distance) {
+                    distance = gap;
+                    best = node;
+                }
+            }
+            return best;
+        }
+
+        bool followsGrab(const HandState& state, RE::NiAVObject* node) noexcept
+        {
+            return node && (turnedByGrab(state, node) || node == state.grabCollar);
+        }
+
+        void linkSlot(HandState& state, RE::NiTransform* slot, RE::NiAVObject* node) noexcept
+        {
+            for (const auto& link : state.skinLinks) {
+                if (link.slot == slot) {
+                    return;
+                }
+            }
+            const float scale = node->world.scale > 0.0f ? node->world.scale : 1.0f;
+            SkinLink link{};
+            link.slot = slot;
+            link.node = node;
+            link.rotate = slot->rotate * node->world.rotate.Transpose();
+            link.translate = node->world.rotate * (slot->translate - node->world.translate) * (1.0f / scale);
+            state.skinLinks.push_back(link);
+        }
+
+        // One skinned mesh: classify each bone it binds to, link the transform
+        // slots the grab must move by hand, and log meshes that would stretch.
+        void scanGeometry(HandState& state, RE::NiAVObject* object, int& logged) noexcept
+        {
+            auto* geometry = object->IsGeometry();
+            if (!geometry) {
+                return;
+            }
+            const std::string_view meshName = safeName(object);
+            auto* skin = geometry->GetRuntimeData().skinInstance.get();
+            if (!skin) {
+                return;
+            }
+            const bool skinValid = looksLikeGameObject(skin) && readable(skin, sizeof(RE::BSSkin::Instance)) && skin->bonesData &&
+                                   skin->bonesCount > 0 && skin->bonesCount < 256 &&
+                                   readable(skin->bonesData, skin->bonesCount * sizeof(void*));
+            if (!skinValid) {
+                if (logged < 30) {
+                    char text[200]{};
+                    std::snprintf(text, sizeof(text), "  skin '%.*s' has an unreadable skin instance %p", static_cast<int>(meshName.size()), meshName.data(), static_cast<const void*>(skin));
+                    npctouch::runtime::logInfo(text);
+                    ++logged;
+                }
+                return;
+            }
+            auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
+            auto** worlds = static_cast<RE::NiTransform**>(skin->boneWorldXformData);
+            const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount &&
+                                     readable(worlds, skin->bonesCount * sizeof(void*));
+            std::uint32_t turned = 0, copies = 0, still = 0, unreadable = 0, linked = 0, foreign = 0;
+            char stillText[400]{};
+            int stillUsed = 0;
+            char oddText[500]{};
+            int oddUsed = 0;
+            for (std::uint32_t index = 0; index < skin->bonesCount; ++index) {
+                g_scanStage = "bone";
+                g_scanBone = index;
+                auto* bone = bones[index];
+                RE::NiTransform* slot = worldsMatch ? worlds[index] : nullptr;
+                const bool slotOk = slot && writable(slot, sizeof(RE::NiTransform));
+                const bool boneOk = looksLikeGameObject(bone) && readable(bone, sizeof(RE::NiAVObject));
+                if (!boneOk) {
+                    // The bone pointer is not a game object; the mesh still
+                    // draws from its transform slot. Make the slot follow the
+                    // nearest node when the grab moves that node.
+                    ++unreadable;
+                    float gap{};
+                    auto* nearest = slotOk ? nearestNode(state, slot->translate, gap) : nullptr;
+                    const bool follow = nearest && gap < 15.0f && followsGrab(state, nearest);
+                    if (follow) {
+                        linkSlot(state, slot, nearest);
+                        ++linked;
+                    }
+                    if (oddUsed < 400) {
+                        const std::string_view nearName = nearest ? safeName(nearest) : std::string_view{ "-" };
+                        oddUsed += std::snprintf(
+                            oddText + oddUsed,
+                            sizeof(oddText) - oddUsed,
+                            " #%u %p slot %s near %.*s %.1f%s",
+                            index,
+                            static_cast<const void*>(bone),
+                            slotOk ? "ok" : "bad",
+                            static_cast<int>(nearName.size()),
+                            nearName.data(),
+                            nearest ? gap : -1.0f,
+                            follow ? " linked" : "");
+                        oddUsed = std::min(oddUsed, static_cast<int>(sizeof(oddText)) - 1);
+                    }
+                    continue;
+                }
+                const std::string_view name = safeName(bone);
+                if (slot && slot != &bone->world) {
+                    ++foreign;
+                    if (slotOk && turnedByGrab(state, bone)) {
+                        linkSlot(state, slot, bone);
+                        ++linked;
+                    }
+                }
+                if (turnedByGrab(state, bone)) {
+                    ++turned;
+                } else if (namedLikeGrab(state, name)) {
+                    ++copies;
+                    if (std::find(state.grabCopies.begin(), state.grabCopies.end(), bone) == state.grabCopies.end()) {
+                        state.grabCopies.push_back(bone);
+                    }
+                } else {
+                    ++still;
+                    if (relevantToGrab(state, name) && stillUsed < 340) {
+                        stillUsed += std::snprintf(stillText + stillUsed, sizeof(stillText) - stillUsed, " %.*s", static_cast<int>(name.size()), name.data());
+                        stillUsed = std::min(stillUsed, static_cast<int>(sizeof(stillText)) - 1);
+                    }
+                }
+            }
+            const bool involved = (turned + copies + linked) > 0;
+            if (!involved || logged >= 30) {
+                return;
+            }
+            char text[1100]{};
+            std::snprintf(
+                text,
+                sizeof(text),
+                "  skin '%.*s' (%u bones): turned %u, copies %u, still %u, unreadable %u, linked %u, own slots %u%s%s%s",
+                static_cast<int>(meshName.size()),
+                meshName.data(),
+                skin->bonesCount,
+                turned,
+                copies,
+                still,
+                unreadable,
+                linked,
+                foreign,
+                stillUsed ? " | still near grab:" : "",
+                stillText,
+                worldsMatch ? "" : " | no slot array");
+            npctouch::runtime::logInfo(text);
+            ++logged;
+            if (oddUsed > 0 && logged < 30) {
+                char line[600]{};
+                std::snprintf(line, sizeof(line), "    unreadable bones:%s", oddText);
+                npctouch::runtime::logInfo(line);
+                ++logged;
+            }
+        }
+
+        // The skin instance layout comes from reverse engineering, so a fault in
+        // one mesh only skips that mesh.
+        bool tryScanGeometry(HandState& state, RE::NiAVObject* object, int& logged) noexcept
+        {
+            __try {
+                scanGeometry(state, object, logged);
+                return true;
+            } __except (1) {
+                return false;
+            }
+        }
+
+        void scanSkins(HandState& state, RE::NiAVObject* object, int& logged, int& faults, const int depth = 0) noexcept
+        {
+            if (!looksLikeGameObject(object) || depth > 64) {
                 return;
             }
             g_scanObject = object;
             g_scanStage = "geometry";
-            if (auto* geometry = object->IsGeometry()) {
-                g_scanStage = "skin instance";
-                auto* skin = geometry->GetRuntimeData().skinInstance.get();
-                const bool skinValid = looksLikeGameObject(skin) && readable(skin, sizeof(RE::BSSkin::Instance)) && skin->bonesData &&
-                                       skin->bonesCount > 0 && skin->bonesCount < 256 &&
-                                       readable(skin->bonesData, skin->bonesCount * sizeof(void*));
-                if (skin && !skinValid && logged < 24) {
+            if (object->IsGeometry() && !tryScanGeometry(state, object, logged)) {
+                ++faults;
+                if (faults <= 3) {
                     char text[200]{};
-                    std::snprintf(text, sizeof(text), "  skin '%s' has an unreadable skin instance %p", object->GetName().data(), static_cast<const void*>(skin));
+                    std::snprintf(text, sizeof(text), "  skin scan skipped a mesh at %s (object %p, bone %u)", g_scanStage, static_cast<const void*>(object), g_scanBone);
                     npctouch::runtime::logInfo(text);
-                    ++logged;
-                }
-                if (!skin && state.scanNearValid && !turnedByGrab(state, object) && length(object->world.translate - state.scanNear) < 30.0f && logged < 24) {
-                    char text[300]{};
-                    int used = std::snprintf(
-                        text,
-                        sizeof(text),
-                        "  rigid mesh '%s' %.0f from the joint, parents",
-                        object->GetName().data(),
-                        length(object->world.translate - state.scanNear));
-                    int level = 0;
-                    for (auto* up = object->parent; up && level < 4 && used < 260; up = up->parent, ++level) {
-                        used += std::snprintf(text + used, sizeof(text) - used, " < %s", up->GetName().data());
-                    }
-                    npctouch::runtime::logInfo(text);
-                    ++logged;
-                }
-                if (skinValid) {
-                    auto** bones = static_cast<RE::NiAVObject**>(skin->bonesData);
-                    auto** worlds = static_cast<RE::NiTransform**>(skin->boneWorldXformData);
-                    const bool worldsMatch = worlds && skin->boneWorldXformCount == skin->bonesCount &&
-                                             readable(worlds, skin->bonesCount * sizeof(void*));
-                    std::uint32_t turned = 0, copies = 0, still = 0, foreign = 0;
-                    char text[900]{};
-                    int used = std::snprintf(text, sizeof(text), "  skin '%s' (%u bones):", object->GetName().data(), skin->bonesCount);
-                    for (std::uint32_t index = 0; index < skin->bonesCount; ++index) {
-                        g_scanStage = "bone";
-                        g_scanBone = index;
-                        auto* bone = bones[index];
-                        if (!looksLikeGameObject(bone) || !readable(bone, sizeof(RE::NiAVObject))) {
-                            continue;
-                        }
-                        const std::string_view name = bone->GetName();
-                        char mark = '-';
-                        if (turnedByGrab(state, bone)) {
-                            mark = 'T';
-                            ++turned;
-                        } else if (namedLikeGrab(state, name)) {
-                            mark = 'C';
-                            ++copies;
-                            if (std::find(state.grabCopies.begin(), state.grabCopies.end(), bone) == state.grabCopies.end()) {
-                                state.grabCopies.push_back(bone);
-                            }
-                        } else {
-                            ++still;
-                        }
-                        if (worldsMatch && worlds[index] != &bone->world) {
-                            ++foreign;
-                        }
-                        if (mark != '-' || used < 700) {
-                            used += std::snprintf(
-                                text + used,
-                                sizeof(text) - used,
-                                " %.*s[%c<%s]",
-                                static_cast<int>(name.size()),
-                                name.data(),
-                                mark,
-                                bone->parent ? bone->parent->GetName().data() : "-");
-                            used = std::min(used, static_cast<int>(sizeof(text)) - 1);
-                        }
-                    }
-                    if ((turned + copies) > 0 && still == 0 && logged < 24) {
-                        char line[200]{};
-                        std::snprintf(line, sizeof(line), "  skin '%s' binds only to turned bones (%u)", object->GetName().data(), turned + copies);
-                        npctouch::runtime::logInfo(line);
-                        ++logged;
-                    }
-                    if ((turned + copies) > 0 && still > 0 && logged < 24) {
-                        std::snprintf(text + used, sizeof(text) - used, " | world ptrs not on bone %u", foreign);
-                        npctouch::runtime::logInfo(text);
-                        ++logged;
-                    }
                 }
             }
-            g_scanObject = object;
-            g_scanStage = "children";
             if (auto* node = object->IsNode()) {
                 auto& children = node->GetRuntimeData().children;
                 for (std::uint16_t index = 0; index < children.size(); ++index) {
-                    scanSkins(state, children[index].get(), logged, depth + 1);
+                    scanSkins(state, children[index].get(), logged, faults, depth + 1);
                 }
             }
         }
 
-        // The skin instance layout comes from reverse engineering, so a wrong
-        // offset must only turn the scan off, not the whole plugin.
-        bool tryScanSkins(HandState& state, RE::NiAVObject* root, int& logged) noexcept
+        // Nodes first (so slots can find their nearest node), then the meshes.
+        void collectNodes(HandState& state, RE::NiAVObject* object, const int depth = 0) noexcept
+        {
+            if (!looksLikeGameObject(object) || depth > 64) {
+                return;
+            }
+            if (auto* node = object->IsNode()) {
+                state.scanNodes.push_back(object);
+                auto& children = node->GetRuntimeData().children;
+                for (std::uint16_t index = 0; index < children.size(); ++index) {
+                    collectNodes(state, children[index].get(), depth + 1);
+                }
+            }
+        }
+
+        bool tryCollectNodes(HandState& state, RE::NiAVObject* root) noexcept
         {
             __try {
-                scanSkins(state, root, logged);
+                collectNodes(state, root);
                 return true;
             } __except (1) {
                 return false;
+            }
+        }
+
+        bool tryScanSkins(HandState& state, RE::NiAVObject* root, int& logged, int& faults) noexcept
+        {
+            __try {
+                scanSkins(state, root, logged, faults);
+                return true;
+            } __except (1) {
+                return false;
+            }
+        }
+
+        // After the pose: skin slots that do not read from a turned bone get
+        // that bone's new transform (keeping their offset from it).
+        void moveLinkedSlots(HandState& state) noexcept
+        {
+            for (const auto& link : state.skinLinks) {
+                auto* node = link.node;
+                const float scale = node->world.scale > 0.0f ? node->world.scale : 1.0f;
+                link.slot->rotate = link.rotate * node->world.rotate;
+                link.slot->translate = node->world.translate + node->world.rotate.Transpose() * link.translate * scale;
             }
         }
 
@@ -1201,6 +1387,7 @@ namespace
                     turnNode(head, headTurn, head->world.translate);
                 }
             }
+            moveLinkedSlots(state);
             state.lastJointWorld = joint->world;
             if (state.skinBone) {
                 state.lastSkinWorld = state.skinBone->world;
@@ -1408,22 +1595,24 @@ namespace
                     }
                 }
             }
-            if (joint && root && g_scanSkinsEnabled && !g_scanBroken) {
+            state.skinLinks.clear();
+            if (joint && root && g_scanSkinsEnabled) {
                 int logged = 0;
+                int faults = 0;
                 char text[200]{};
-                if (tryScanSkins(state, root, logged)) {
-                    std::snprintf(text, sizeof(text), "  skins: %d meshes bind across the turned bones, %zu bone copies found", logged, state.grabCopies.size());
-                } else {
-                    g_scanBroken = true;
-                    state.grabCopies.clear();
-                    std::snprintf(
-                        text,
-                        sizeof(text),
-                        "  skin scan faulted at %s (object %p, bone %u); scan off until restart",
-                        g_scanStage,
-                        static_cast<const void*>(g_scanObject),
-                        g_scanBone);
-                }
+                state.scanNodes.clear();
+                const bool nodesOk = tryCollectNodes(state, root);
+                const bool walked = nodesOk && tryScanSkins(state, root, logged, faults);
+                state.scanNodes.clear();
+                std::snprintf(
+                    text,
+                    sizeof(text),
+                    "  skins: %d lines, %zu bone copies, %zu slots linked, %d meshes skipped%s",
+                    logged,
+                    state.grabCopies.size(),
+                    state.skinLinks.size(),
+                    faults,
+                    walked ? "" : ", walk stopped by a fault");
                 npctouch::runtime::logInfo(text);
             }
             if (joint) {
