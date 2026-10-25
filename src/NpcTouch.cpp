@@ -342,8 +342,12 @@ namespace
             bool gripWasHeld{ false };
             std::uint32_t grabbedFormId{ 0 };
             const char* grabbedBone{ nullptr };
-            RE::NiPoint3 grabOffset{};  // hand minus bone at the moment of the grab
-            Clock::time_point lastMove{};
+            RE::NiAVObject* grabRoot{ nullptr };
+            RE::NiAVObject* grabJoint{ nullptr };
+            RE::NiPoint3 grabLocal{};  // grabbed point in the joint's own frame
+            float grabReach{ 0.0f };   // joint to grabbed point
+            std::uint32_t posedFrames{ 0 };
+            std::uint32_t keptFrames{ 0 };
             std::uint32_t gripStatusLogged{ 0 };
         };
 
@@ -351,13 +355,9 @@ namespace
         constexpr std::uint32_t kGripButton = 2;
         // The hand may be this far from the body (beyond a touch) to grab.
         constexpr float kGrabReach = 10.0f;
-        // Hand movement the NPC ignores before following, and the pull at which
-        // the grip slips.
-        constexpr float kGrabSlack = 3.0f;
-        constexpr float kGrabBreak = 45.0f;
-        // Fastest drag, game units per second (walking is about 100).
-        constexpr float kGrabMaxSpeed = 160.0f;
-        constexpr auto kGrabMoveInterval = std::chrono::milliseconds(33);
+        // The grip slips when the hand gets this much further from the joint
+        // than the grabbed point is.
+        constexpr float kGrabBreak = 40.0f;
 
         std::array<HandState, 2> g_handStates{};
 
@@ -533,72 +533,187 @@ namespace
 
         void endGrab(const rock::api::Hand hand, HandState& state, const char* reason) noexcept
         {
-            char message[160]{};
-            std::snprintf(message, sizeof(message), "GRAB END: %s hand let go of %08X (%s)", handName(hand), state.grabbedFormId, reason);
+            char message[200]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "GRAB END: %s hand let go of %08X (%s), posed %u frames, pose kept by game %u",
+                handName(hand),
+                state.grabbedFormId,
+                reason,
+                state.posedFrames,
+                state.keptFrames);
             npctouch::runtime::logInfo(message);
             state.grabbedFormId = 0;
             state.grabbedBone = nullptr;
+            state.grabJoint = nullptr;
+        }
+
+        // The joint a grabbed bone turns around: arms at the shoulder, the head
+        // on the neck. Torso grabs hold on without posing anything.
+        const char* jointFor(const char* bone) noexcept
+        {
+            if (!bone) {
+                return nullptr;
+            }
+            if (std::strncmp(bone, "LArm_", 5) == 0) {
+                return "LArm_UpperArm";
+            }
+            if (std::strncmp(bone, "RArm_", 5) == 0) {
+                return "RArm_UpperArm";
+            }
+            if (std::strcmp(bone, "Head") == 0 || std::strcmp(bone, "Neck") == 0) {
+                return "Neck";
+            }
+            return nullptr;
+        }
+
+        float length(const RE::NiPoint3& v) noexcept
+        {
+            return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        }
+
+        // Rotation (v' = R v) that turns unit vector a onto unit vector b.
+        RE::NiMatrix3 rotationBetween(const RE::NiPoint3& a, const RE::NiPoint3& b, float& angle) noexcept
+        {
+            RE::NiPoint3 axis{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+            const float sine = length(axis);
+            const float cosine = std::clamp(a.x * b.x + a.y * b.y + a.z * b.z, -1.0f, 1.0f);
+            angle = std::atan2(sine, cosine);
+            RE::NiMatrix3 r{};
+            r.MakeIdentity();
+            if (sine < 1e-5f) {
+                return r;
+            }
+            axis = axis * (1.0f / sine);
+            const float t = 1.0f - cosine;
+            const float x = axis.x, y = axis.y, z = axis.z;
+            r.entry[0][0] = cosine + x * x * t;
+            r.entry[0][1] = x * y * t - z * sine;
+            r.entry[0][2] = x * z * t + y * sine;
+            r.entry[1][0] = y * x * t + z * sine;
+            r.entry[1][1] = cosine + y * y * t;
+            r.entry[1][2] = y * z * t - x * sine;
+            r.entry[2][0] = z * x * t - y * sine;
+            r.entry[2][1] = z * y * t + x * sine;
+            r.entry[2][2] = cosine + z * z * t;
+            return r;
+        }
+
+        // Recomputes world transforms below a node we moved, so the skin and
+        // the proxy capsules see the new pose this frame.
+        void updateChildren(RE::NiAVObject* object, const int depth = 0) noexcept
+        {
+            auto* node = object ? object->IsNode() : nullptr;
+            if (!node || depth > 32) {
+                return;
+            }
+            auto& children = node->GetRuntimeData().children;
+            for (std::uint16_t index = 0; index < children.size(); ++index) {
+                auto* child = children[index].get();
+                if (!child) {
+                    continue;
+                }
+                child->world.rotate = object->world.rotate * child->local.rotate;
+                child->world.translate = object->world.translate + object->world.rotate * (child->local.translate * object->world.scale);
+                child->world.scale = object->world.scale * child->local.scale;
+                updateChildren(child, depth + 1);
+            }
+        }
+
+        // Turns the joint so the grabbed point sits in the hand.
+        void poseGrab(HandState& state, RE::NiAVObject* joint) noexcept
+        {
+            auto* parent = joint->parent;
+            if (!parent) {
+                return;
+            }
+            const RE::NiPoint3 current = joint->world.rotate * state.grabLocal * joint->world.scale;
+            const RE::NiPoint3 wanted = state.position - joint->world.translate;
+            const float currentLength = length(current);
+            const float wantedLength = length(wanted);
+            if (currentLength < 1.0f || wantedLength < 1.0f) {
+                return;
+            }
+            float angle{ 0.0f };
+            const auto turn = rotationBetween(current * (1.0f / currentLength), wanted * (1.0f / wantedLength), angle);
+            // If last frame's pose is still there, the game did not re-animate
+            // the joint since; worth knowing for timing.
+            if (angle < 0.02f) {
+                ++state.keptFrames;
+            }
+            ++state.posedFrames;
+            joint->world.rotate = turn * joint->world.rotate;
+            joint->local.rotate = parent->world.rotate.Transpose() * joint->world.rotate;
+            updateChildren(joint);
         }
 
         void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
         {
             const bool pressed = grip && !state.gripWasHeld;
             state.gripWasHeld = grip;
-            const auto now = Clock::now();
 
             if (state.grabbedFormId != 0) {
                 auto* actor = RE::TESForm::GetFormByID<RE::Actor>(state.grabbedFormId);
                 auto* root = actor ? actor->Get3D() : nullptr;
-                auto* bone = root ? findNode(root, state.grabbedBone) : nullptr;
                 if (!grip) {
                     endGrab(hand, state, "released");
                     return;
                 }
-                if (!bone || actor->IsDead(false)) {
+                if (!root || actor->IsDead(false) || root != state.grabRoot) {
                     endGrab(hand, state, "NPC gone");
                     return;
                 }
-                // Where the grabbed bone should be to stay in the hand, on the ground plane.
-                RE::NiPoint3 shift = state.position - state.grabOffset - bone->world.translate;
-                shift.z = 0.0f;
-                const float pull = std::sqrt(shift.x * shift.x + shift.y * shift.y);
-                if (pull > kGrabBreak) {
-                    endGrab(hand, state, "slipped");
-                    return;
-                }
-                const float seconds = std::chrono::duration<float>(now - state.lastMove).count();
-                if (pull > kGrabSlack && now - state.lastMove >= kGrabMoveInterval) {
-                    const float step = std::min(pull - kGrabSlack, kGrabMaxSpeed * std::min(seconds, 0.1f));
-                    const auto feet = actor->GetPosition();
-                    (void)npctouch::reactions::moveActor(actor, feet.x + shift.x / pull * step, feet.y + shift.y / pull * step, feet.z);
-                    state.lastMove = now;
+                if (state.grabJoint) {
+                    const RE::NiPoint3 reach = state.position - state.grabJoint->world.translate;
+                    if (length(reach) > state.grabReach + kGrabBreak) {
+                        endGrab(hand, state, "slipped");
+                        return;
+                    }
+                    poseGrab(state, state.grabJoint);
                 }
                 return;
             }
 
-            if (!pressed || !hit.actor || hit.gap > kGrabReach || hit.actor->IsDead(false) ||
-                hit.actor->DoGetSitSleepState() != RE::SIT_SLEEP_STATE::kNormal) {
+            if (!pressed) {
                 return;
             }
-            auto* root = hit.actor->Get3D();
-            auto* bone = root ? findNode(root, hit.bone) : nullptr;
-            if (!bone) {
-                return;
-            }
-            state.grabbedFormId = hit.actor->GetFormID();
-            state.grabbedBone = hit.bone;
-            state.grabOffset = state.position - bone->world.translate;
-            state.lastMove = now;
-            char message[200]{};
+            char message[220]{};
             std::snprintf(
                 message,
                 sizeof(message),
-                "GRAB BEGIN: %s hand grabbed '%s' form=%08X bone=%s gap=%.0f",
+                "GRIP PRESS: %s hand, nearest '%s' bone=%s gap=%.0f",
+                handName(hand),
+                hit.actor ? actorName(hit.actor) : "-",
+                hit.actor ? hit.bone : "-",
+                hit.actor ? hit.gap : -1.0f);
+            npctouch::runtime::logInfo(message);
+            if (!hit.actor || hit.gap > kGrabReach || hit.actor->IsDead(false)) {
+                return;
+            }
+            auto* root = hit.actor->Get3D();
+            const char* jointName = jointFor(hit.bone);
+            auto* joint = root && jointName ? findNode(root, jointName) : nullptr;
+            state.grabbedFormId = hit.actor->GetFormID();
+            state.grabbedBone = hit.bone;
+            state.grabRoot = root;
+            state.grabJoint = joint;
+            state.posedFrames = 0;
+            state.keptFrames = 0;
+            if (joint) {
+                const RE::NiPoint3 offset = state.position - joint->world.translate;
+                state.grabReach = length(offset);
+                state.grabLocal = joint->world.rotate.Transpose() * offset * (1.0f / joint->world.scale);
+            }
+            std::snprintf(
+                message,
+                sizeof(message),
+                "GRAB BEGIN: %s hand grabbed '%s' form=%08X bone=%s joint=%s",
                 handName(hand),
                 actorName(hit.actor),
                 state.grabbedFormId,
                 hit.bone,
-                hit.gap);
+                joint ? jointName : "none");
             npctouch::runtime::logInfo(message);
             char overlay[128]{};
             std::snprintf(overlay, sizeof(overlay), "NpcTouch: grabbed %s (%s)", actorName(hit.actor), hit.bone);
