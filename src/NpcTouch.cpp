@@ -413,6 +413,15 @@ namespace
         bool g_scanSkinsEnabled{ true };
         float g_collarShare{ 0.3f };
         float g_neckShare{ 0.5f };
+        // Flinch settings (see the [Flinch] section of the ini).
+        bool g_flinchEnabled{ true };
+        float g_flinchFollow{ 0.7f };      // share of the hand's motion the body takes
+        float g_flinchStiffness{ 9.0f };   // spring frequency back to the animation, rad/s
+        float g_flinchDamping{ 0.55f };    // damping ratio of that spring
+        float g_flinchMinSpeed{ 20.0f };   // slower hands only touch
+        float g_flinchMaxTorso{ 0.25f };
+        float g_flinchMaxHead{ 0.5f };
+        float g_flinchMaxArm{ 0.7f };
 
         std::array<HandState, 2> g_handStates{};
 
@@ -1506,14 +1515,6 @@ namespace
         // or arm) turns about its joint with the hand's push and springs back.
         // Each flinch keeps its own pose state, so the skin fixes of grabs
         // (bone copies, linked slots) apply to it too.
-        bool g_flinchEnabled{ true };
-        float g_flinchFollow{ 0.7f };      // share of the hand's motion the body takes
-        float g_flinchStiffness{ 9.0f };   // spring frequency back to the animation, rad/s
-        float g_flinchDamping{ 0.55f };    // damping ratio of that spring
-        float g_flinchMinSpeed{ 20.0f };   // slower hands only touch
-        float g_flinchMaxTorso{ 0.25f };
-        float g_flinchMaxHead{ 0.5f };
-        float g_flinchMaxArm{ 0.7f };
 
         struct Flinch
         {
