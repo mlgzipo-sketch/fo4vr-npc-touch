@@ -388,6 +388,7 @@ namespace
         constexpr float kElbowMinAngle = 0.45f;
         constexpr float kElbowMaxAngle = 3.10f;
         bool g_bendElbow{ true };
+        bool g_scanSkinsEnabled{ true };
 
         std::array<HandState, 2> g_handStates{};
 
@@ -1168,12 +1169,14 @@ namespace
                     const float value = std::strtof(line.c_str() + equals + 1, nullptr);
                     if (key == "bBendElbow") {
                         g_bendElbow = value != 0.0f;
+                    } else if (key == "bScanSkins") {
+                        g_scanSkinsEnabled = value != 0.0f;
                     }
                 }
             } catch (...) {
             }
             char message[80]{};
-            std::snprintf(message, sizeof(message), "Grab settings: bend elbow %d", g_bendElbow ? 1 : 0);
+            std::snprintf(message, sizeof(message), "Grab settings: bend elbow %d, scan skins %d", g_bendElbow ? 1 : 0, g_scanSkinsEnabled ? 1 : 0);
             npctouch::runtime::logInfo(message);
         }
 
@@ -1277,7 +1280,7 @@ namespace
             }
             state.skinBone = nullptr;
             state.grabCopies.clear();
-            if (joint && root && !g_scanBroken) {
+            if (joint && root && g_scanSkinsEnabled && !g_scanBroken) {
                 int logged = 0;
                 char text[200]{};
                 if (tryScanSkins(state, root, logged)) {
