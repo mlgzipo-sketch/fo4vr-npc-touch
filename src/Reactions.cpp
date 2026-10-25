@@ -61,6 +61,9 @@ namespace npctouch::reactions
             bool knockdowns{ false };
             float knockdownSpeed{ 180.0f };
             float knockdownForce{ 1.0f };
+            // How far NPCs step away when the player bumps into them; the game
+            // uses 75-128. Negative keeps the game's values.
+            float bumpMoveDistance{ 0.0f };
         } g_settings{};
 
         bool g_papyrusAvailable{ false };
@@ -169,7 +172,9 @@ namespace npctouch::reactions
                     const auto value = trim(line.substr(equals + 1));
                     const float number = std::strtof(value.c_str(), nullptr);
                     const bool flag = number != 0.0f;
-                    if (key == "bEnableReactions") {
+                    if (key == "fBumpMoveDistance") {
+                        g_settings.bumpMoveDistance = number;
+                    } else if (key == "bEnableReactions") {
                         g_settings.enabled = flag;
                     } else if (key == "bAllowCombat") {
                         g_settings.allowCombat = flag;
@@ -243,6 +248,35 @@ namespace npctouch::reactions
                 return missing.empty();
             } catch (...) {
                 return false;
+            }
+        }
+
+        // NPCs the player walks into step aside (the game's bump reaction),
+        // which in VR means they back away from hands reaching for them.
+        void keepNPCsCloseOnBump() noexcept
+        {
+            if (g_settings.bumpMoveDistance < 0.0f) {
+                return;
+            }
+            if (!addressLibraryHas({ 8308, 8308 })) {
+                runtime::logWarning("Address library lacks the game settings entry; NPCs keep stepping away on bumps");
+                return;
+            }
+            auto* settings = RE::GameSettingCollection::GetSingleton();
+            if (!settings) {
+                return;
+            }
+            for (const char* name : { "fBumpReactionIdealMoveDist", "fBumpReactionMinMoveDist" }) {
+                auto* setting = settings->GetSetting(name);
+                char message[160]{};
+                if (setting) {
+                    const float old = setting->GetFloat();
+                    setting->SetFloat(g_settings.bumpMoveDistance);
+                    std::snprintf(message, sizeof(message), "Game setting %s: %.0f -> %.0f", name, old, g_settings.bumpMoveDistance);
+                } else {
+                    std::snprintf(message, sizeof(message), "Game setting %s not found", name);
+                }
+                runtime::logInfo(message);
             }
         }
 
@@ -567,6 +601,7 @@ namespace npctouch::reactions
     void initialize() noexcept
     {
         loadSettings();
+        keepNPCsCloseOnBump();
         g_papyrusAvailable = addressLibraryHas({ 996227, 614600 });
         if (!g_papyrusAvailable) {
             runtime::logWarning("Address library lacks the Papyrus VM entries; NPCs will not speak or turn");
