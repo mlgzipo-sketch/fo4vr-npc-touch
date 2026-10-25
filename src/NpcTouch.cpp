@@ -9,6 +9,7 @@
 #include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
 #include <ROCK/Input.h>
+#include "HandGrip.h"
 #include "NpcCollision.h"
 #include "NpcProxyBodies.h"
 #include "Reactions.h"
@@ -597,6 +598,7 @@ namespace
 
         void endGrab(const rock::api::Hand hand, HandState& state, const char* reason) noexcept
         {
+            npctouch::grip::release(hand == rock::api::Hand::Left);
             char message[200]{};
             std::snprintf(
                 message,
@@ -1768,6 +1770,11 @@ namespace
                     }
                     poseGrab(state, state.grabJoint);
                 }
+                if (state.releasing) {
+                    npctouch::grip::release(hand == rock::api::Hand::Left);
+                } else {
+                    npctouch::grip::hold(hand == rock::api::Hand::Left, state.grabbedBone);
+                }
                 if (!state.releasing) {
                     const auto now = Clock::now();
                     const float seconds = std::chrono::duration<float>(now - state.lastHoldReaction).count();
@@ -2122,6 +2129,7 @@ namespace
             npctouch::collision::initialize();
             npctouch::proxies::initialize();
             proximity::loadGrabSettings();
+            npctouch::grip::loadSettings();
             reactionsReady = true;
         }
         return true;

@@ -43,6 +43,9 @@ add_library(NpcTouch SHARED
   src/NpcTouch.cpp
   src/Reactions.cpp
   src/Reactions.h
+  src/HandGrip.cpp
+  src/HandGrip.h
+  src/api/FRIKApiV2.h
 )
 target_compile_features(NpcTouch PRIVATE cxx_std_23)
 target_compile_definitions(NpcTouch PRIVATE
