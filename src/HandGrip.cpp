@@ -60,9 +60,9 @@ namespace npctouch::grip
         {
             float prox = 0.15f, mid = 0.2f, dist = 0.15f, thumb = 0.1f;
             if (bone) {
-                if (std::strstr(bone, "_Hand") || std::strstr(bone, "ForeArm")) {
+                if (std::strstr(bone, "_Hand") || std::strstr(bone, "ForeArm") || std::strstr(bone, "Leg_Calf") || std::strstr(bone, "Leg_Foot")) {
                     prox = 0.75f, mid = 0.8f, dist = 0.6f, thumb = 0.6f;
-                } else if (std::strstr(bone, "UpperArm")) {
+                } else if (std::strstr(bone, "UpperArm") || std::strstr(bone, "Leg_Thigh")) {
                     prox = 0.55f, mid = 0.6f, dist = 0.45f, thumb = 0.45f;
                 } else if (std::strcmp(bone, "Neck") == 0) {
                     prox = 0.6f, mid = 0.65f, dist = 0.5f, thumb = 0.5f;

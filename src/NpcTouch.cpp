@@ -330,6 +330,12 @@ namespace
             Bone{ "RArm_ForeArm1", 7.0f },
             Bone{ "LArm_Hand", 7.0f },
             Bone{ "RArm_Hand", 7.0f },
+            Bone{ "LLeg_Thigh", 9.0f },
+            Bone{ "RLeg_Thigh", 9.0f },
+            Bone{ "LLeg_Calf", 6.5f },
+            Bone{ "RLeg_Calf", 6.5f },
+            Bone{ "LLeg_Foot", 5.0f },
+            Bone{ "RLeg_Foot", 5.0f },
         };
 
         constexpr float kSearchRadius = 250.0f;
@@ -676,6 +682,17 @@ namespace
             if (std::strcmp(bone, "Head") == 0 || std::strcmp(bone, "Neck") == 0) {
                 return "Neck";
             }
+            // Held by the hips, the body bends at the waist like at the shoulders.
+            if ((std::strcmp(bone, "Pelvis") == 0 || std::strcmp(bone, "SPINE1") == 0) && g_shoulderMovesBody) {
+                return "SPINE1";
+            }
+            // A leg swings at the hip.
+            if (std::strncmp(bone, "LLeg_", 5) == 0) {
+                return "LLeg_Thigh";
+            }
+            if (std::strncmp(bone, "RLeg_", 5) == 0) {
+                return "RLeg_Thigh";
+            }
             return nullptr;
         }
 
@@ -1004,11 +1021,33 @@ namespace
             return node && (turnedByGrab(state, node) || node == state.grabCollar);
         }
 
-        void linkSlot(HandState& state, RE::NiTransform* slot, RE::NiAVObject* node) noexcept
+        // A skin slot that is really a bone transform: an orthonormal rotation
+        // and a sane scale. Anything else is not ours to write.
+        bool looksLikeTransform(const RE::NiTransform& value) noexcept
         {
+            if (!(value.scale > 0.2f && value.scale < 5.0f)) {
+                return false;
+            }
+            for (int row = 0; row < 3; ++row) {
+                const RE::NiPoint3 axis{ value.rotate.entry[row][0], value.rotate.entry[row][1], value.rotate.entry[row][2] };
+                if (std::abs(dot(axis, axis) - 1.0f) > 0.05f) {
+                    return false;
+                }
+            }
+            const RE::NiPoint3 x{ value.rotate.entry[0][0], value.rotate.entry[0][1], value.rotate.entry[0][2] };
+            const RE::NiPoint3 y{ value.rotate.entry[1][0], value.rotate.entry[1][1], value.rotate.entry[1][2] };
+            const RE::NiPoint3 z{ value.rotate.entry[2][0], value.rotate.entry[2][1], value.rotate.entry[2][2] };
+            return std::abs(dot(x, y)) < 0.05f && std::abs(dot(cross(x, y), z) - 1.0f) < 0.1f;
+        }
+
+        bool linkSlot(HandState& state, RE::NiTransform* slot, RE::NiAVObject* node) noexcept
+        {
+            if (!looksLikeTransform(*slot)) {
+                return false;
+            }
             for (const auto& link : state.skinLinks) {
                 if (link.slot == slot) {
-                    return;
+                    return true;
                 }
             }
             const float scale = node->world.scale > 0.0f ? node->world.scale : 1.0f;
@@ -1018,6 +1057,7 @@ namespace
             link.rotate = slot->rotate * node->world.rotate.Transpose();
             link.translate = node->world.rotate * (slot->translate - node->world.translate) * (1.0f / scale);
             state.skinLinks.push_back(link);
+            return true;
         }
 
         // One skinned mesh: classify each bone it binds to, link the transform
@@ -1069,8 +1109,7 @@ namespace
                     float gap{};
                     auto* nearest = slotOk ? nearestNode(state, slot->translate, gap) : nullptr;
                     const bool follow = nearest && gap < 15.0f && followsGrab(state, nearest);
-                    if (follow) {
-                        linkSlot(state, slot, nearest);
+                    if (follow && linkSlot(state, slot, nearest)) {
                         ++linked;
                     }
                     if (oddUsed < 400) {
@@ -1093,8 +1132,7 @@ namespace
                 const std::string_view name = safeName(bone);
                 if (slot && slot != &bone->world) {
                     ++foreign;
-                    if (slotOk && turnedByGrab(state, bone)) {
-                        linkSlot(state, slot, bone);
+                    if (slotOk && turnedByGrab(state, bone) && linkSlot(state, slot, bone)) {
                         ++linked;
                     }
                 }
@@ -1623,6 +1661,16 @@ namespace
             if (std::strcmp(bone, "Pelvis") == 0) {
                 return { "Pelvis", "SPINE1", 11.0f };
             }
+            const bool leftLeg = std::strncmp(bone, "LLeg_", 5) == 0;
+            if (std::strstr(bone, "Leg_Thigh")) {
+                return { bone, leftLeg ? "LLeg_Calf" : "RLeg_Calf", 6.5f };
+            }
+            if (std::strstr(bone, "Leg_Calf")) {
+                return { bone, leftLeg ? "LLeg_Foot" : "RLeg_Foot", 4.5f };
+            }
+            if (std::strstr(bone, "Leg_Foot")) {
+                return { leftLeg ? "LLeg_Calf" : "RLeg_Calf", bone, 3.5f };
+            }
             return {};
         }
 
@@ -1746,6 +1794,10 @@ namespace
                 maxAngle = g_flinchMaxHead;
                 return "Neck";
             }
+            if (std::strncmp(bone, "LLeg_", 5) == 0 || std::strncmp(bone, "RLeg_", 5) == 0) {
+                maxAngle = g_flinchMaxArm * 0.5f;
+                return bone[0] == 'L' ? "LLeg_Thigh" : "RLeg_Thigh";
+            }
             if (std::strcmp(bone, "Chest") == 0 || std::strcmp(bone, "SPINE2") == 0) {
                 maxAngle = g_flinchMaxTorso;
                 return "SPINE2";
@@ -1813,15 +1865,21 @@ namespace
             if (!g_flinchEnabled || !hit.actor || hit.actor->IsDead(false) || grabbedByHand(hit.actor->GetFormID())) {
                 return;
             }
-            const RE::NiPoint3 velocity{ hand.velocity[0], hand.velocity[1], hand.velocity[2] };
-            if (length(velocity) < g_flinchMinSpeed) {
+            RE::NiPoint3 velocity{ hand.velocity[0], hand.velocity[1], hand.velocity[2] };
+            const float speed = length(velocity);
+            if (speed < g_flinchMinSpeed) {
                 return;
+            }
+            // A tracking jump can report thousands of units per second.
+            constexpr float kMaxHandSpeed = 400.0f;
+            if (speed > kMaxHandSpeed) {
+                velocity = velocity * (kMaxHandSpeed / speed);
             }
             float maxAngle{ 0.0f };
             const char* jointName = flinchJoint(hit.bone, maxAngle);
             // An arm only gives way to a real hit, so a hand reaching for it
             // slowly does not push it away.
-            const bool armJoint = jointName && std::strstr(jointName, "UpperArm");
+            const bool armJoint = jointName && (std::strstr(jointName, "UpperArm") || std::strstr(jointName, "Thigh"));
             if (armJoint && length(velocity) < g_flinchMinSpeedArm) {
                 return;
             }
@@ -2078,7 +2136,7 @@ namespace
                 if (name.find("UpperArm") != std::string_view::npos && joint->parent && g_collarShare > 0.0f) {
                     state.grabCollar = joint->parent;
                 }
-                state.grabTorso = name == "SPINE2";
+                state.grabTorso = name == "SPINE2" || name == "SPINE1";
                 if (name == "Neck") {
                     if (auto* head = findNode(joint, "Head")) {
                         state.scanNear = head->world.translate;
