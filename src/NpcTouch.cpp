@@ -348,6 +348,10 @@ namespace
             float grabReach{ 0.0f };   // joint to grabbed point
             std::uint32_t posedFrames{ 0 };
             std::uint32_t keptFrames{ 0 };
+            // For diagnosis: what we set last frame on the joint and one skin bone.
+            RE::NiAVObject* skinBone{ nullptr };
+            RE::NiTransform lastJointWorld{};
+            RE::NiTransform lastSkinWorld{};
             std::uint32_t gripStatusLogged{ 0 };
         };
 
@@ -684,6 +688,37 @@ namespace
             listChildren(joint, "joint");
         }
 
+        // How far a node's world transform is from parent.world * local:
+        // zero for bones the scene graph drives, large for bones set elsewhere.
+        void hierarchyError(RE::NiAVObject* object, float& rotation, float& translation) noexcept
+        {
+            rotation = translation = -1.0f;
+            auto* parent = object ? object->parent : nullptr;
+            if (!parent) {
+                return;
+            }
+            const auto expected = parent->world.rotate * object->local.rotate;
+            rotation = 0.0f;
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    rotation = std::max(rotation, std::abs(expected.entry[row][column] - object->world.rotate.entry[row][column]));
+                }
+            }
+            const auto expectedTranslate = parent->world.translate + parent->world.rotate * (object->local.translate * parent->world.scale);
+            translation = length(expectedTranslate - object->world.translate);
+        }
+
+        float rotationGap(const RE::NiMatrix3& a, const RE::NiMatrix3& b) noexcept
+        {
+            float gap = 0.0f;
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    gap = std::max(gap, std::abs(a.entry[row][column] - b.entry[row][column]));
+                }
+            }
+            return gap;
+        }
+
         // Turns the joint so the grabbed point sits in the hand.
         void poseGrab(HandState& state, RE::NiAVObject* joint) noexcept
         {
@@ -705,11 +740,30 @@ namespace
             if (angle < 0.02f) {
                 ++state.keptFrames;
             }
+            // For the first frames, log whether last frame's pose on the joint
+            // and on a skin bone survived until now.
+            if (state.posedFrames >= 1 && state.posedFrames <= 3) {
+                char message[256]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "  pose frame %u: joint since last set rot %.3f; skin bone %s since last set rot %.3f move %.1f",
+                    state.posedFrames,
+                    rotationGap(joint->world.rotate, state.lastJointWorld.rotate),
+                    state.skinBone ? state.skinBone->GetName().data() : "-",
+                    state.skinBone ? rotationGap(state.skinBone->world.rotate, state.lastSkinWorld.rotate) : -1.0f,
+                    state.skinBone ? length(state.skinBone->world.translate - state.lastSkinWorld.translate) : -1.0f);
+                npctouch::runtime::logInfo(message);
+            }
             ++state.posedFrames;
             joint->world.rotate = turn * joint->world.rotate;
             joint->local.rotate = parent->world.rotate.Transpose() * joint->world.rotate;
             turnChildren(joint, turn, joint->world.translate);
             turnTwistSiblings(joint, turn);
+            state.lastJointWorld = joint->world;
+            if (state.skinBone) {
+                state.lastSkinWorld = state.skinBone->world;
+            }
         }
 
         void updateGrab(const rock::api::Hand hand, HandState& state, const Hit& hit, const bool grip) noexcept
@@ -764,8 +818,30 @@ namespace
             state.grabJoint = joint;
             state.posedFrames = 0;
             state.keptFrames = 0;
+            state.skinBone = nullptr;
             if (joint) {
                 describeJoint(joint);
+                if (auto* node = joint->IsNode()) {
+                    char text[512]{};
+                    int used = std::snprintf(text, sizeof(text), "  hierarchy error (rot/move) of %s children:", joint->GetName().data());
+                    auto& children = node->GetRuntimeData().children;
+                    for (std::uint16_t index = 0; index < children.size() && used < 460; ++index) {
+                        auto* child = children[index].get();
+                        if (!child) {
+                            continue;
+                        }
+                        float rotation{}, translation{};
+                        hierarchyError(child, rotation, translation);
+                        used += std::snprintf(text + used, sizeof(text) - used, " %s=%.3f/%.1f", child->GetName().data(), rotation, translation);
+                        if (!state.skinBone && std::strstr(child->GetName().data(), "_skin")) {
+                            state.skinBone = child;
+                        }
+                    }
+                    float rotation{}, translation{};
+                    hierarchyError(joint, rotation, translation);
+                    used += std::snprintf(text + used, sizeof(text) - used, " | joint=%.3f/%.1f", rotation, translation);
+                    npctouch::runtime::logInfo(text);
+                }
                 const RE::NiPoint3 offset = state.position - joint->world.translate;
                 state.grabReach = length(offset);
                 state.grabLocal = joint->world.rotate.Transpose() * offset * (1.0f / joint->world.scale);
