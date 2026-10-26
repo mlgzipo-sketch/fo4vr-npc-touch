@@ -29,7 +29,7 @@ Data\F4SE\Plugins\NpcTouch.dll
 Data\F4SE\Plugins\NpcTouch.ini
 ```
 
-Releases are on the [Releases page](https://github.com/mlgzipo-sketch/fo4vr-npc-touch/releases). The latest test build of every commit is under **Actions**.
+The latest build of every commit is under **Actions** (download the NpcTouch archive at the bottom of a green run).
 
 ## Settings
 
