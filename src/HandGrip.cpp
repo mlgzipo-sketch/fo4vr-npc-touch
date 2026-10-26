@@ -48,7 +48,7 @@ namespace npctouch::grip
                 } else {
                     std::snprintf(message, sizeof(message), "Hand grip: FRIK API v2 unavailable (error %d); fingers stay as they are", error);
                 }
-                npctouch::runtime::logInfo(message);
+                npctouch::runtime::logNote(message);
             }
             return FRIKApiV2::inst;
         }

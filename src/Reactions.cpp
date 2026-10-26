@@ -243,7 +243,7 @@ namespace npctouch::reactions
                 g_settings.lineTopics.size(),
                 g_settings.warningTopics.size(),
                 g_settings.closeAffinity);
-            runtime::logInfo(message);
+            runtime::logNote(message);
         }
 
         // A missing address-library entry would stop the game with an error

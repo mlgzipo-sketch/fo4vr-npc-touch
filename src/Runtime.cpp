@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -24,6 +25,31 @@ namespace
     std::shared_ptr<spdlog::logger> g_logger;
     std::uint64_t g_ownerToken{ 0 };
     std::uint64_t g_callbackToken{ 0 };
+
+    bool g_verbose{ false };
+
+    bool readDebugLogSetting() noexcept
+    {
+        try {
+            std::ifstream file("Data/F4SE/Plugins/NpcTouch.ini");
+            std::string line;
+            while (file && std::getline(file, line)) {
+                const auto equals = line.find('=');
+                if (line.empty() || line[0] == ';' || equals == std::string::npos) {
+                    continue;
+                }
+                auto key = line.substr(0, equals);
+                while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) {
+                    key.pop_back();
+                }
+                if (key == "bDebugLog") {
+                    return std::strtof(line.c_str() + equals + 1, nullptr) != 0.0f;
+                }
+            }
+        } catch (...) {
+        }
+        return false;
+    }
 
     void initializeLogger()
     {
@@ -48,6 +74,7 @@ namespace
         g_logger->set_pattern("%Y-%m-%d %H:%M:%S.%e [%l] %v");
         g_logger->set_level(spdlog::level::info);
         g_logger->flush_on(spdlog::level::info);
+        g_verbose = readDebugLogSetting();
     }
 
     void disconnectRock() noexcept
@@ -115,7 +142,7 @@ namespace
             return false;
         }
 
-        npctouch::runtime::logInfo("Connected to independently negotiated ROCK providers");
+        npctouch::runtime::logNote("Connected to independently negotiated ROCK providers");
         return true;
     }
 
@@ -142,6 +169,13 @@ namespace
 namespace npctouch::runtime
 {
     void logInfo(const std::string_view message) noexcept
+    {
+        if (g_verbose) {
+            logNote(message);
+        }
+    }
+
+    void logNote(const std::string_view message) noexcept
     {
         try {
             if (g_logger) {
@@ -201,7 +235,7 @@ extern "C" __declspec(dllexport) bool F4SEAPI F4SEPlugin_Query(
             a_f4se->F4SEVersion().string().c_str(),
             a_f4se->RuntimeVersion().string().c_str(),
             executableVersion.string().c_str());
-        npctouch::runtime::logInfo(message);
+        npctouch::runtime::logNote(message);
         return true;
     } catch (...) {
         return false;
@@ -221,7 +255,7 @@ extern "C" __declspec(dllexport) bool F4SEAPI F4SEPlugin_Load(
             npctouch::runtime::logWarning("F4SE messaging registration failed");
             return false;
         }
-        npctouch::runtime::logInfo("Plugin loaded; waiting for game data");
+        npctouch::runtime::logNote("Plugin loaded; waiting for game data");
         return true;
     } catch (...) {
         return false;

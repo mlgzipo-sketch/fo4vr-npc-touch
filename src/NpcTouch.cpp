@@ -1589,7 +1589,7 @@ namespace
                 g_scanSkinsEnabled ? 1 : 0,
                 g_collarShare,
                 g_neckShare);
-            npctouch::runtime::logInfo(message);
+            npctouch::runtime::logNote(message);
             std::snprintf(
                 message,
                 sizeof(message),
@@ -1602,7 +1602,7 @@ namespace
                 g_flinchMaxTorso,
                 g_flinchMaxHead,
                 g_flinchMaxArm);
-            npctouch::runtime::logInfo(message);
+            npctouch::runtime::logNote(message);
         }
 
         // Transforms in the game's row convention: world = local * parent.
@@ -2461,7 +2461,7 @@ namespace
             g_input = nullptr;
             npctouch::runtime::logWarning("ROCK input interface unavailable; grabbing NPCs disabled");
         } else {
-            npctouch::runtime::logInfo("ROCK input interface ready; grip + touch grabs NPCs");
+            npctouch::runtime::logNote("ROCK input interface ready; grip + touch grabs NPCs");
         }
         return true;
     }
@@ -2473,7 +2473,7 @@ namespace
         g_otherTouchCount = 0;
         g_lastSummary = Clock::now();
         g_overlayUntil = {};
-        npctouch::runtime::logInfo("Listening for hand touches on NPCs (build " NPCTOUCH_BUILD ")");
+        npctouch::runtime::logNote("Listening for hand touches on NPCs (build " NPCTOUCH_BUILD ")");
         static bool reactionsReady = false;
         if (!reactionsReady) {
             npctouch::reactions::initialize();

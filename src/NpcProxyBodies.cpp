@@ -777,7 +777,7 @@ namespace npctouch::proxies
             g_radiusScale,
             g_legs ? 1 : 0,
             g_maxNpcs);
-        runtime::logInfo(message);
+        runtime::logNote(message);
     }
 
     void update(const bool worldAvailable) noexcept
