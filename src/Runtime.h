@@ -24,7 +24,7 @@ namespace npctouch::runtime
     };
 
     [[nodiscard]] const Definition& definition() noexcept;
-    // Detail for testing; written only with bDebugLog=1 in NpcTouch.ini.
+    // Detail for testing; written only with bDebugLog=1 in the plugin's ini.
     void logInfo(std::string_view message) noexcept;
     // Startup and settings lines, always written.
     void logNote(std::string_view message) noexcept;
