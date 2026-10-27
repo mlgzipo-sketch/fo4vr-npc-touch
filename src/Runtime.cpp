@@ -31,7 +31,7 @@ namespace
     bool readDebugLogSetting() noexcept
     {
         try {
-            std::ifstream file(std::string("Data/F4SE/Plugins/") + npctouch::runtime::definition().pluginName + ".ini");
+            std::ifstream file("Data/F4SE/Plugins/NpcTouch.ini");
             std::string line;
             while (file && std::getline(file, line)) {
                 const auto equals = line.find('=');
