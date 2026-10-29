@@ -427,6 +427,8 @@ namespace
         return length(sub(toVec(g_state.plane->worldBound.center), t.planeCenter));
     }
 
+    void packChildren(RE::NiNode& node, RE::NiAVObject* backdrop) noexcept;
+
     void detachBackdrop(const char* why) noexcept
     {
         auto* backdrop = g_state.backdrop;
@@ -435,8 +437,9 @@ namespace
         }
         __try {
             setCulled(backdrop, true);
-            if (backdrop->parent) {
-                backdrop->parent->DetachChild(backdrop);
+            if (auto* parent = backdrop->parent) {
+                parent->DetachChild(backdrop);
+                packChildren(*parent, nullptr);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -564,31 +567,50 @@ namespace
         return nullptr;
     }
 
-    // Logs the parent's children and, with bDrawFirst, moves the backdrop to
-    // the first slot so it is drawn before the loading text and tips, which
-    // don't write depth and would otherwise be painted over.
-    void orderChildren(RE::NiNode& parent, RE::NiAVObject* backdrop) noexcept
+    // Packs a node's children to the front in their current order, with the
+    // backdrop (when attached there) first or, without bDrawFirst, last.
+    // Swapping slots would also swap the text's own shadow and glass quads,
+    // which puts the shadow over the text; packing keeps their order, and
+    // running it again after a detach leaves the node as the game built it.
+    void packChildren(RE::NiNode& node, RE::NiAVObject* backdrop) noexcept
     {
-        auto& children = parent.GetRuntimeData().children;
-        if (children.capacity() == 0) {
+        auto& children = node.GetRuntimeData().children;
+        const std::uint16_t capacity = children.capacity();
+        if (capacity == 0) {
             return;
         }
         auto** raw = reinterpret_cast<RE::NiAVObject**>(&children[0]);
-        int backdropSlot = -1;
-        for (std::uint16_t i = 0; i < children.capacity(); ++i) {
-            if (raw[i] == backdrop) {
-                backdropSlot = i;
-            }
-            if (raw[i]) {
-                char message[200]{};
-                std::snprintf(message, sizeof(message), "  %s child %u: %s", nameOf(&parent), i, nameOf(raw[i]));
-                logInfo(message);
+        RE::NiAVObject* others[64]{};
+        std::uint16_t count = 0;
+        bool hasBackdrop = false;
+        for (std::uint16_t i = 0; i < capacity; ++i) {
+            if (raw[i] == backdrop && backdrop) {
+                hasBackdrop = true;
+            } else if (raw[i] && count < 64) {
+                others[count++] = raw[i];
             }
         }
-        if (g_settings.drawFirst && backdropSlot > 0) {
-            std::swap(raw[0], raw[backdropSlot]);
-            char message[160]{};
-            std::snprintf(message, sizeof(message), "  backdrop moved from slot %d to slot 0", backdropSlot);
+        if (count + (hasBackdrop ? 1 : 0) > capacity || count == 64) {
+            return;
+        }
+        std::uint16_t slot = 0;
+        if (hasBackdrop && g_settings.drawFirst) {
+            raw[slot++] = backdrop;
+        }
+        for (std::uint16_t i = 0; i < count; ++i) {
+            raw[slot++] = others[i];
+        }
+        if (hasBackdrop && !g_settings.drawFirst) {
+            raw[slot++] = backdrop;
+        }
+        for (std::uint16_t i = slot; i < capacity; ++i) {
+            raw[i] = nullptr;
+        }
+        // NiTArray keeps one past the last used slot at +0x12 (_freeIdx).
+        *reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::uint8_t*>(&children) + 0x12) = slot;
+        for (std::uint16_t i = 0; i < slot; ++i) {
+            char message[200]{};
+            std::snprintf(message, sizeof(message), "  %s child %u: %s", nameOf(&node), i, nameOf(raw[i]));
             logInfo(message);
         }
     }
@@ -616,12 +638,13 @@ namespace
         auto* text = findTextNode(*parent, model, &ordered);
         auto* host = g_settings.behindText && ordered ? ordered : parent;
         if (backdrop->parent != host) {
-            if (backdrop->parent) {
-                backdrop->parent->DetachChild(backdrop);
+            if (auto* previous = backdrop->parent) {
+                previous->DetachChild(backdrop);
+                packChildren(*previous, nullptr);
             }
             g_state.target = computeTarget(*parent, *model, text);
             host->AttachChild(backdrop, true);
-            orderChildren(*host, backdrop);
+            packChildren(*host, backdrop);
             dumpScene(*parent);
             setCulled(backdrop, false);
             g_state.parent = host;
