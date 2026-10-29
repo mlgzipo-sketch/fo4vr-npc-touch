@@ -634,8 +634,7 @@ namespace
     // don't write depth, so the backdrop paints over them. With bHudDepth the
     // quads write depth while the loading screen is up, alpha tested so only
     // the drawn pixels do; the backdrop tests depth and stays behind them.
-    // BSGeometry keeps its alpha property at +0x130 and its shader property at
-    // +0x138; BSShaderProperty keeps its 64-bit flags at +0x30.
+    // BSShaderProperty keeps its 64-bit flags at +0x30.
     constexpr std::uint64_t kShaderZTest = std::uint64_t{ 1 } << 31;
     constexpr std::uint64_t kShaderZWrite = std::uint64_t{ 1 } << 32;
     constexpr std::uint16_t kAlphaTest = 1 << 9;
@@ -654,8 +653,28 @@ namespace
                 continue;
             }
             auto* bytes = reinterpret_cast<std::uint8_t*>(quad);
-            auto* alpha = *reinterpret_cast<std::uint8_t**>(bytes + 0x130);
-            auto* shader = *reinterpret_cast<std::uint8_t**>(bytes + 0x138);
+            // The property slots sit elsewhere in VR's BSGeometry, so look
+            // for them by type past the NiAVObject part.
+            std::uint8_t* alpha{ nullptr };
+            std::uint8_t* shader{ nullptr };
+            for (int offset = 0x120; offset < 0x1C0; offset += 8) {
+                auto* field = *reinterpret_cast<std::uint8_t**>(bytes + offset);
+                if (reinterpret_cast<std::uintptr_t>(field) < 0x10000) {
+                    continue;
+                }
+                const std::string_view type = rttiName(field);
+                if (!type.starts_with(".?AV")) {
+                    continue;
+                }
+                char line[200]{};
+                std::snprintf(line, sizeof(line), "    %s +0x%X [%.80s]", nameOf(quad), offset, type.data());
+                logNote(line);
+                if (!alpha && type.find("NiAlphaProperty") != std::string_view::npos) {
+                    alpha = field;
+                } else if (!shader && type.find("ShaderProperty") != std::string_view::npos) {
+                    shader = field;
+                }
+            }
             const std::string_view alphaType = alpha ? rttiName(alpha) : "none";
             const std::string_view shaderType = shader ? rttiName(shader) : "none";
             auto& saved = g_state.hud[g_state.hudCount];
