@@ -681,9 +681,15 @@ namespace
             char message[400]{};
             if (shaderType.find("ShaderProperty") != std::string_view::npos) {
                 auto& flags = *reinterpret_cast<std::uint64_t*>(shader + 0x30);
-                saved.shader = shader;
-                saved.shaderFlags = flags;
-                flags |= kShaderZWrite | kShaderZTest;
+                // A pointer there would mean the layout differs too: leave it.
+                const bool looksLikeFlags = flags != 0 && !std::string_view(rttiName(reinterpret_cast<void*>(flags))).starts_with(".?AV");
+                if (looksLikeFlags) {
+                    saved.shader = shader;
+                    saved.shaderFlags = flags;
+                    flags |= kShaderZWrite | kShaderZTest;
+                } else {
+                    saved.shaderFlags = flags;
+                }
             }
             if (alphaType.find("NiAlphaProperty") != std::string_view::npos) {
                 auto& flags = *reinterpret_cast<std::uint16_t*>(alpha + 0x28);
