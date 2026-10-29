@@ -57,7 +57,7 @@ namespace
     {
         bool enabled{ true };
         std::string model{ "LoadScreenBG\\Background.nif" };
-        float distance{ 900.0f };
+        float distance{ 3000.0f };
         float widthDegrees{ 110.0f };
         float heightOffset{ 0.0f };
         bool showOverlay{ false };
@@ -66,7 +66,7 @@ namespace
         bool behindText{ true };
         float aimBlend{ 0.5f };
         bool dumpScene{ true };
-        bool hudDepth{ true };
+        int hudDepth{ 2 };
         bool debugLog{ true };
     } g_settings;
 
@@ -156,8 +156,8 @@ namespace
                     g_settings.aimBlend = number;
                 } else if (key == "bDumpScene") {
                     g_settings.dumpScene = number != 0.0f;
-                } else if (key == "bHudDepth") {
-                    g_settings.hudDepth = number != 0.0f;
+                } else if (key == "iHudDepth") {
+                    g_settings.hudDepth = static_cast<int>(number);
                 } else if (key == "bBehindText") {
                     g_settings.behindText = number != 0.0f;
                 } else if (key == "bDrawFirst") {
@@ -177,9 +177,9 @@ namespace
             g_settings.widthDegrees = 110.0f;
         }
         char message[320]{};
-        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f aim=%.2f behindText=%d overlay=%d rotationMode=%d",
+        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f aim=%.2f behindText=%d drawFirst=%d hudDepth=%d overlay=%d rotationMode=%d",
             g_settings.enabled, g_settings.model.c_str(), g_settings.distance, g_settings.widthDegrees, g_settings.heightOffset,
-            g_settings.aimBlend, g_settings.behindText, g_settings.showOverlay, g_settings.rotationMode);
+            g_settings.aimBlend, g_settings.behindText, g_settings.drawFirst, g_settings.hudDepth, g_settings.showOverlay, g_settings.rotationMode);
         logNote(message);
     }
 
@@ -643,7 +643,7 @@ namespace
 
     void protectText(RE::NiNode& ordered) noexcept
     {
-        if (!g_settings.hudDepth || g_state.hudCount > 0) {
+        if (g_settings.hudDepth <= 0 || g_state.hudCount > 0) {
             return;
         }
         auto& children = ordered.GetRuntimeData().children;
@@ -686,7 +686,11 @@ namespace
                 if (looksLikeFlags) {
                     saved.shader = shader;
                     saved.shaderFlags = flags;
-                    flags |= kShaderZWrite | kShaderZTest;
+                    if (g_settings.hudDepth == 1) {
+                        flags |= kShaderZWrite | kShaderZTest;
+                    } else {
+                        flags &= ~(kShaderZWrite | kShaderZTest);
+                    }
                 } else {
                     saved.shaderFlags = flags;
                 }
@@ -697,12 +701,14 @@ namespace
                 saved.alpha = alpha;
                 saved.alphaFlags = flags;
                 saved.alphaRef = ref;
-                flags = static_cast<std::uint16_t>((flags & ~kAlphaTestMask) | kAlphaTest | kAlphaTestGreater);
-                ref = 8;
+                if (g_settings.hudDepth == 1) {
+                    flags = static_cast<std::uint16_t>((flags & ~kAlphaTestMask) | kAlphaTest | kAlphaTestGreater);
+                    ref = 8;
+                }
             }
             std::snprintf(message, sizeof(message), "  text quad %s: shader [%.60s] flags %016llX, alpha [%.40s] flags %04X ref %d%s",
                 nameOf(quad), shaderType.data(), static_cast<unsigned long long>(saved.shaderFlags), alphaType.data(),
-                saved.alphaFlags, saved.alphaRef, saved.shader ? "; now writes depth" : "; left as is");
+                saved.alphaFlags, saved.alphaRef, !saved.shader ? "; left as is" : g_settings.hudDepth == 1 ? "; now writes depth" : "; now ignores depth");
             logNote(message);
             if (saved.shader || saved.alpha) {
                 ++g_state.hudCount;
