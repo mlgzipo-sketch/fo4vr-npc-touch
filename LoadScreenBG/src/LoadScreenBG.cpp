@@ -46,7 +46,8 @@ namespace
     // Half the size of LoadScreen02.nif's MenuBGBack plane and how far it
     // sits in front of the mesh's origin, in mesh units.
     constexpr float kPlaneHalfWidth = 557.5f;
-    constexpr float kPlaneDepth = 991.0f;
+    // (MenuBGBack's vertices sit at 991 plus its own 9 unit offset.)
+    constexpr float kPlaneDepth = 1000.0f;
 
     struct Settings
     {
@@ -56,7 +57,7 @@ namespace
         float widthDegrees{ 110.0f };
         float heightOffset{ 0.0f };
         bool showOverlay{ false };
-        bool transposeRotation{ false };
+        int rotationMode{ 0 };
         bool debugLog{ true };
     } g_settings;
 
@@ -142,8 +143,8 @@ namespace
                     g_settings.heightOffset = number;
                 } else if (key == "bShowOverlay") {
                     g_settings.showOverlay = number != 0.0f;
-                } else if (key == "bTransposeRotation") {
-                    g_settings.transposeRotation = number != 0.0f;
+                } else if (key == "iRotationMode") {
+                    g_settings.rotationMode = static_cast<int>(number);
                 } else if (key == "bDebugLog") {
                     g_settings.debugLog = number != 0.0f;
                 }
@@ -157,9 +158,9 @@ namespace
             g_settings.widthDegrees = 110.0f;
         }
         char message[320]{};
-        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f overlay=%d transpose=%d",
+        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f overlay=%d rotationMode=%d",
             g_settings.enabled, g_settings.model.c_str(), g_settings.distance, g_settings.widthDegrees, g_settings.heightOffset,
-            g_settings.showOverlay, g_settings.transposeRotation);
+            g_settings.showOverlay, g_settings.rotationMode);
         logNote(message);
     }
 
@@ -203,14 +204,26 @@ namespace
     // Where the backdrop should stay in the world while one loading screen is up.
     struct Target
     {
-        float rotate[3][3]{};  // columns are the mesh's axes in world space
-        Vec translate;
+        Vec axes[3];  // the mesh's X (right), Y (away from the eye) and Z (up) in world space
+        Vec translate;  // mesh origin
+        Vec planeCenter;
         float scale{ 1.0f };
+    };
+
+    // How NiTransform reads its matrix: 1 = axes in columns, parent * local
+    // (as in the CommonLib headers); 2 = axes in rows, local * parent.
+    // Picked on the first attach by checking where the engine puts the plane.
+    enum Convention : int
+    {
+        kColumns = 1,
+        kRows = 2,
     };
 
     struct State
     {
         RE::NiAVObject* backdrop{ nullptr };
+        RE::NiAVObject* plane{ nullptr };
+        int convention{ 0 };
         bool loadTried{ false };
         RE::NiNode* parent{ nullptr };
         Target target;
@@ -276,6 +289,9 @@ namespace
                 }
                 const std::string_view name = nameOf(child);
                 const bool overlay = name.starts_with("OverlayFlat");
+                if (name.starts_with("MenuBGBack")) {
+                    g_state.plane = child;
+                }
                 if (overlay && !g_settings.showOverlay) {
                     setCulled(child, true);
                 }
@@ -330,44 +346,65 @@ namespace
         t.scale = g_settings.distance * std::tan(halfAngle) / kPlaneHalfWidth;
         // The plane sits kPlaneDepth in front of the mesh origin; put the
         // origin back so the plane lands at fDistance.
-        t.translate = add(add(eye, mul(dir, g_settings.distance - kPlaneDepth * t.scale)), Vec{ 0.0f, 0.0f, g_settings.heightOffset });
-        const Vec axes[3] = { right, dir, up };
-        for (int column = 0; column < 3; ++column) {
-            t.rotate[0][column] = axes[column].x;
-            t.rotate[1][column] = axes[column].y;
-            t.rotate[2][column] = axes[column].z;
-        }
+        t.planeCenter = add(add(eye, mul(dir, g_settings.distance)), Vec{ 0.0f, 0.0f, g_settings.heightOffset });
+        t.translate = sub(t.planeCenter, mul(dir, kPlaneDepth * t.scale));
+        t.axes[0] = right;
+        t.axes[1] = dir;
+        t.axes[2] = up;
         return t;
     }
 
     // Local transform under the parent that keeps the backdrop at its world target.
-    void applyTarget(RE::NiAVObject& backdrop, const RE::NiNode& parent, const Target& t) noexcept
+    void applyTarget(RE::NiAVObject& backdrop, const RE::NiNode& parent, const Target& t, const int convention) noexcept
     {
-        const auto& pr = parent.world.rotate.entry;
+        float p[3][3]{};
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                p[i][j] = parent.world.rotate.entry[i][j];
+            }
+        }
         const float ps = parent.world.scale != 0.0f ? parent.world.scale : 1.0f;
-        float local[3][3]{};
+        const Vec d = sub(t.translate, toVec(parent.world.translate));
+        const float dv[3] = { d.x, d.y, d.z };
+        float target[3][3]{};
+        for (int axis = 0; axis < 3; ++axis) {
+            const float a[3] = { t.axes[axis].x, t.axes[axis].y, t.axes[axis].z };
+            for (int k = 0; k < 3; ++k) {
+                if (convention == kRows) {
+                    target[axis][k] = a[k];
+                } else {
+                    target[k][axis] = a[k];
+                }
+            }
+        }
+        float localPos[3]{};
         for (int i = 0; i < 3; ++i) {
             for (int j = 0; j < 3; ++j) {
                 float sum = 0.0f;
                 for (int k = 0; k < 3; ++k) {
-                    sum += pr[k][i] * t.rotate[k][j];  // parent^T * target
+                    // columns: parent^T * target; rows: target * parent^T
+                    sum += convention == kRows ? target[i][k] * p[j][k] : p[k][i] * target[k][j];
                 }
-                local[i][j] = sum;
+                backdrop.local.rotate.entry[i][j] = sum;
             }
-        }
-        const Vec offset = sub(t.translate, toVec(parent.world.translate));
-        Vec localPos{};
-        localPos.x = (pr[0][0] * offset.x + pr[1][0] * offset.y + pr[2][0] * offset.z) / ps;
-        localPos.y = (pr[0][1] * offset.x + pr[1][1] * offset.y + pr[2][1] * offset.z) / ps;
-        localPos.z = (pr[0][2] * offset.x + pr[1][2] * offset.y + pr[2][2] * offset.z) / ps;
-
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                backdrop.local.rotate.entry[i][j] = g_settings.transposeRotation ? local[j][i] : local[i][j];
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                // columns: parent^T * d; rows: d * parent^T
+                sum += convention == kRows ? dv[k] * p[i][k] : p[k][i] * dv[k];
             }
+            localPos[i] = sum / ps;
         }
-        backdrop.local.translate = RE::NiPoint3(localPos.x, localPos.y, localPos.z);
+        backdrop.local.translate = RE::NiPoint3(localPos[0], localPos[1], localPos[2]);
         backdrop.local.scale = t.scale / ps;
+    }
+
+    // How far the engine put the plane from where it was meant to be.
+    float placementError(const Target& t) noexcept
+    {
+        if (!g_state.plane) {
+            return -1.0f;
+        }
+        return length(sub(toVec(g_state.plane->worldBound.center), t.planeCenter));
     }
 
     void detachBackdrop(const char* why) noexcept
@@ -387,6 +424,36 @@ namespace
             logInfo(why);
         }
         g_state.parent = nullptr;
+    }
+
+    // Tries both readings and keeps the one that lands the plane on target.
+    void pickConvention(RE::NiAVObject& backdrop, const RE::NiNode& parent) noexcept
+    {
+        const auto& p = parent.world.rotate.entry;
+        char message[400]{};
+        std::snprintf(message, sizeof(message), "Parent rotation rows: (%.2f %.2f %.2f) (%.2f %.2f %.2f) (%.2f %.2f %.2f) scale=%.2f; plane target=(%.0f, %.0f, %.0f)",
+            p[0][0], p[0][1], p[0][2], p[1][0], p[1][1], p[1][2], p[2][0], p[2][1], p[2][2], parent.world.scale,
+            g_state.target.planeCenter.x, g_state.target.planeCenter.y, g_state.target.planeCenter.z);
+        logNote(message);
+
+        float errors[3]{ -1.0f, -1.0f, -1.0f };
+        for (const int convention : { kColumns, kRows }) {
+            applyTarget(backdrop, parent, g_state.target, convention);
+            updateNode(&backdrop);
+            errors[convention] = placementError(g_state.target);
+            const auto c = g_state.plane ? toVec(g_state.plane->worldBound.center) : Vec{};
+            std::snprintf(message, sizeof(message), "  reading %s: plane at (%.0f, %.0f, %.0f), %.0f units off",
+                convention == kColumns ? "columns" : "rows", c.x, c.y, c.z, errors[convention]);
+            logNote(message);
+        }
+        int chosen = errors[kRows] >= 0.0f && errors[kRows] < errors[kColumns] ? kRows : kColumns;
+        if (g_settings.rotationMode == kColumns || g_settings.rotationMode == kRows) {
+            chosen = g_settings.rotationMode;
+        }
+        g_state.convention = chosen;
+        applyTarget(backdrop, parent, g_state.target, chosen);
+        updateNode(&backdrop);
+        logNote(chosen == kRows ? "Using the rows reading" : "Using the columns reading");
     }
 
     void afterAdvance() noexcept
@@ -423,10 +490,14 @@ namespace
                 nameOf(parent), parent->world.translate.x, parent->world.translate.y, parent->world.translate.z,
                 nameOf(model), model->worldBound.center.x, model->worldBound.center.y, model->worldBound.center.z, model->worldBound.fRadius,
                 g_state.target.translate.x, g_state.target.translate.y, g_state.target.translate.z,
-                g_state.target.rotate[0][1], g_state.target.rotate[1][1], g_state.target.scale);
+                g_state.target.axes[1].x, g_state.target.axes[1].y, g_state.target.scale);
             logNote(message);
         }
-        applyTarget(*backdrop, *parent, g_state.target);
+        if (g_state.convention == 0) {
+            pickConvention(*backdrop, *parent);
+            return;
+        }
+        applyTarget(*backdrop, *parent, g_state.target, g_state.convention);
         updateNode(backdrop);
     }
 
