@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -58,6 +59,7 @@ namespace
         float heightOffset{ 0.0f };
         bool showOverlay{ false };
         int rotationMode{ 0 };
+        bool drawFirst{ true };
         bool debugLog{ true };
     } g_settings;
 
@@ -143,6 +145,8 @@ namespace
                     g_settings.heightOffset = number;
                 } else if (key == "bShowOverlay") {
                     g_settings.showOverlay = number != 0.0f;
+                } else if (key == "bDrawFirst") {
+                    g_settings.drawFirst = number != 0.0f;
                 } else if (key == "iRotationMode") {
                     g_settings.rotationMode = static_cast<int>(number);
                 } else if (key == "bDebugLog") {
@@ -456,6 +460,35 @@ namespace
         logNote(chosen == kRows ? "Using the rows reading" : "Using the columns reading");
     }
 
+    // Logs the parent's children and, with bDrawFirst, moves the backdrop to
+    // the first slot so it is drawn before the loading text and tips, which
+    // don't write depth and would otherwise be painted over.
+    void orderChildren(RE::NiNode& parent, RE::NiAVObject* backdrop) noexcept
+    {
+        auto& children = parent.GetRuntimeData().children;
+        if (children.capacity() == 0) {
+            return;
+        }
+        auto** raw = reinterpret_cast<RE::NiAVObject**>(&children[0]);
+        int backdropSlot = -1;
+        for (std::uint16_t i = 0; i < children.capacity(); ++i) {
+            if (raw[i] == backdrop) {
+                backdropSlot = i;
+            }
+            if (raw[i]) {
+                char message[200]{};
+                std::snprintf(message, sizeof(message), "  %s child %u: %s", nameOf(&parent), i, nameOf(raw[i]));
+                logInfo(message);
+            }
+        }
+        if (g_settings.drawFirst && backdropSlot > 0) {
+            std::swap(raw[0], raw[backdropSlot]);
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "  backdrop moved from slot %d to slot 0", backdropSlot);
+            logInfo(message);
+        }
+    }
+
     void afterAdvance() noexcept
     {
         if (!g_settings.enabled || *reinterpret_cast<const bool*>(base() + kVrLoadingMenuSetting) == false) {
@@ -481,6 +514,7 @@ namespace
             }
             g_state.target = computeTarget(*parent, *model);
             parent->AttachChild(backdrop, true);
+            orderChildren(*parent, backdrop);
             setCulled(backdrop, false);
             g_state.parent = parent;
 
