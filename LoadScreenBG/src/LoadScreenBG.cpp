@@ -16,6 +16,7 @@
 #include <REX/W32/SHELL32.h>
 #include <Windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,8 @@ namespace
     constexpr std::uintptr_t kLoadingModelNode = 0x5B3D210;
     // bVrLoadingMenu:VR value.
     constexpr std::uintptr_t kVrLoadingMenuSetting = 0x3843F58;
+    // VR UI object whose node +0x28 ("World") LoadingMenu hangs the model on.
+    constexpr std::uintptr_t kVrLoadingScene = 0x5ACA408;
     // BSModelDB::Demand(path, handle*, args*): the overload LoadingMenu's
     // backdrop loader uses; the node is at +0x20 of the returned entry.
     constexpr std::uintptr_t kModelDemand = 0x1D0DD80;
@@ -60,6 +63,8 @@ namespace
         bool showOverlay{ false };
         int rotationMode{ 0 };
         bool drawFirst{ true };
+        float aimBlend{ 0.7f };
+        bool dumpScene{ true };
         bool debugLog{ true };
     } g_settings;
 
@@ -145,6 +150,10 @@ namespace
                     g_settings.heightOffset = number;
                 } else if (key == "bShowOverlay") {
                     g_settings.showOverlay = number != 0.0f;
+                } else if (key == "fAimBlend") {
+                    g_settings.aimBlend = number;
+                } else if (key == "bDumpScene") {
+                    g_settings.dumpScene = number != 0.0f;
                 } else if (key == "bDrawFirst") {
                     g_settings.drawFirst = number != 0.0f;
                 } else if (key == "iRotationMode") {
@@ -333,6 +342,19 @@ namespace
         }
         Vec dir = sub(center, eye);
         dir.z = 0.0f;
+        // Blend from the model towards straight ahead (the parent's forward
+        // axis, its second row) so the picture sits behind text and model
+        // together rather than behind the model alone.
+        {
+            const auto& r = parent.world.rotate.entry;
+            Vec forward{ r[1][0], r[1][1], 0.0f };
+            if (length(dir) > 1.0f && length(forward) > 1e-3f) {
+                const float blend = std::clamp(g_settings.aimBlend, 0.0f, 1.0f);
+                const Vec toModel = mul(dir, 1.0f / length(dir));
+                forward = mul(forward, 1.0f / length(forward));
+                dir = add(mul(toModel, 1.0f - blend), mul(forward, blend));
+            }
+        }
         if (length(dir) < 1.0f) {
             // Model straight above or below: use the parent's forward (Y) axis.
             const auto& r = parent.world.rotate.entry;
@@ -460,6 +482,70 @@ namespace
         logNote(chosen == kRows ? "Using the rows reading" : "Using the columns reading");
     }
 
+    const char* rttiName(const void* object) noexcept
+    {
+        __try {
+            const auto vtable = *reinterpret_cast<const std::uintptr_t*>(object);
+            const auto col = *reinterpret_cast<const std::uintptr_t*>(vtable - 8);
+            const auto typeRva = *reinterpret_cast<const std::uint32_t*>(col + 12);
+            return reinterpret_cast<const char*>(base() + typeRva + 0x10);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return "?";
+        }
+    }
+
+    void dumpNode(const RE::NiAVObject* object, const int depth) noexcept
+    {
+        if (!object || depth > 7) {
+            return;
+        }
+        char message[360]{};
+        std::snprintf(message, sizeof(message), "  %*s%s [%s] at (%.0f, %.0f, %.0f)%s", depth * 2, "", nameOf(object), rttiName(object),
+            object->world.translate.x, object->world.translate.y, object->world.translate.z, (object->flags.flags & 1) ? " culled" : "");
+        logInfo(message);
+        if (std::string_view(rttiName(object)).find("Node") == std::string_view::npos) {
+            return;
+        }
+        const auto& children = static_cast<const RE::NiNode*>(object)->GetRuntimeData().children;
+        for (std::uint16_t i = 0; i < children.capacity() && i < 64; ++i) {
+            dumpNode(children[i].get(), depth + 1);
+        }
+    }
+
+    // One-off map of the loading scene, to find where the loading text lives.
+    void dumpScene(const RE::NiNode& parent) noexcept
+    {
+        static bool done = false;
+        if (done || !g_settings.dumpScene) {
+            return;
+        }
+        done = true;
+        const RE::NiAVObject* top = &parent;
+        while (top->parent) {
+            top = top->parent;
+        }
+        logInfo("Scene above the loading model:");
+        dumpNode(top, 0);
+        const auto* scene = *reinterpret_cast<std::uint8_t* const*>(base() + kVrLoadingScene);
+        if (!scene) {
+            return;
+        }
+        char message[200]{};
+        std::snprintf(message, sizeof(message), "VR loading scene object [%s]:", rttiName(scene));
+        logInfo(message);
+        for (int offset = 0x08; offset < 0x200; offset += 8) {
+            const auto* field = *reinterpret_cast<RE::NiAVObject* const*>(scene + offset);
+            if (reinterpret_cast<std::uintptr_t>(field) < 0x10000) {
+                continue;
+            }
+            const char* type = rttiName(field);
+            if (std::string_view(type).starts_with(".?AV")) {
+                std::snprintf(message, sizeof(message), "  +0x%X [%s]", offset, type);
+                logInfo(message);
+            }
+        }
+    }
+
     // Logs the parent's children and, with bDrawFirst, moves the backdrop to
     // the first slot so it is drawn before the loading text and tips, which
     // don't write depth and would otherwise be painted over.
@@ -515,6 +601,7 @@ namespace
             g_state.target = computeTarget(*parent, *model);
             parent->AttachChild(backdrop, true);
             orderChildren(*parent, backdrop);
+            dumpScene(*parent);
             setCulled(backdrop, false);
             g_state.parent = parent;
 
