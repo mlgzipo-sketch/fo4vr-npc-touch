@@ -66,6 +66,7 @@ namespace
         bool behindText{ true };
         float aimBlend{ 0.5f };
         bool dumpScene{ true };
+        bool hudDepth{ true };
         bool debugLog{ true };
     } g_settings;
 
@@ -155,6 +156,8 @@ namespace
                     g_settings.aimBlend = number;
                 } else if (key == "bDumpScene") {
                     g_settings.dumpScene = number != 0.0f;
+                } else if (key == "bHudDepth") {
+                    g_settings.hudDepth = number != 0.0f;
                 } else if (key == "bBehindText") {
                     g_settings.behindText = number != 0.0f;
                 } else if (key == "bDrawFirst") {
@@ -244,6 +247,16 @@ namespace
         RE::NiNode* parent{ nullptr };
         Target target;
         bool loggedNoModel{ false };
+        // Text quads changed by protectText, with their original flags.
+        struct HudQuad
+        {
+            std::uint8_t* shader{ nullptr };
+            std::uint64_t shaderFlags{ 0 };
+            std::uint8_t* alpha{ nullptr };
+            std::uint16_t alphaFlags{ 0 };
+            std::int8_t alphaRef{ 0 };
+        } hud[4];
+        int hudCount{ 0 };
     } g_state;
 
     // Demand returns the cached copy, so the mesh is loaded once and kept.
@@ -428,6 +441,7 @@ namespace
     }
 
     void packChildren(RE::NiNode& node, RE::NiAVObject* backdrop) noexcept;
+    void restoreText() noexcept;
 
     void detachBackdrop(const char* why) noexcept
     {
@@ -443,6 +457,7 @@ namespace
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
+        restoreText();
         if (g_state.parent) {
             logInfo(why);
         }
@@ -615,6 +630,80 @@ namespace
         }
     }
 
+    // The text quads are drawn before the backdrop whatever their order, and
+    // don't write depth, so the backdrop paints over them. With bHudDepth the
+    // quads write depth while the loading screen is up, alpha tested so only
+    // the drawn pixels do; the backdrop tests depth and stays behind them.
+    // BSGeometry keeps its alpha property at +0x130 and its shader property at
+    // +0x138; BSShaderProperty keeps its 64-bit flags at +0x30.
+    constexpr std::uint64_t kShaderZTest = std::uint64_t{ 1 } << 31;
+    constexpr std::uint64_t kShaderZWrite = std::uint64_t{ 1 } << 32;
+    constexpr std::uint16_t kAlphaTest = 1 << 9;
+    constexpr std::uint16_t kAlphaTestGreater = 4 << 10;
+    constexpr std::uint16_t kAlphaTestMask = 7 << 10;
+
+    void protectText(RE::NiNode& ordered) noexcept
+    {
+        if (!g_settings.hudDepth || g_state.hudCount > 0) {
+            return;
+        }
+        auto& children = ordered.GetRuntimeData().children;
+        for (std::uint16_t i = 0; i < children.capacity() && g_state.hudCount < 4; ++i) {
+            auto* quad = children[i].get();
+            if (!quad || quad == g_state.backdrop || !std::string_view(nameOf(quad)).starts_with("HUD")) {
+                continue;
+            }
+            auto* bytes = reinterpret_cast<std::uint8_t*>(quad);
+            auto* alpha = *reinterpret_cast<std::uint8_t**>(bytes + 0x130);
+            auto* shader = *reinterpret_cast<std::uint8_t**>(bytes + 0x138);
+            const std::string_view alphaType = alpha ? rttiName(alpha) : "none";
+            const std::string_view shaderType = shader ? rttiName(shader) : "none";
+            auto& saved = g_state.hud[g_state.hudCount];
+            char message[400]{};
+            if (shaderType.find("ShaderProperty") != std::string_view::npos) {
+                auto& flags = *reinterpret_cast<std::uint64_t*>(shader + 0x30);
+                saved.shader = shader;
+                saved.shaderFlags = flags;
+                flags |= kShaderZWrite | kShaderZTest;
+            }
+            if (alphaType.find("NiAlphaProperty") != std::string_view::npos) {
+                auto& flags = *reinterpret_cast<std::uint16_t*>(alpha + 0x28);
+                auto& ref = *reinterpret_cast<std::int8_t*>(alpha + 0x2A);
+                saved.alpha = alpha;
+                saved.alphaFlags = flags;
+                saved.alphaRef = ref;
+                flags = static_cast<std::uint16_t>((flags & ~kAlphaTestMask) | kAlphaTest | kAlphaTestGreater);
+                ref = 8;
+            }
+            std::snprintf(message, sizeof(message), "  text quad %s: shader [%.60s] flags %016llX, alpha [%.40s] flags %04X ref %d%s",
+                nameOf(quad), shaderType.data(), static_cast<unsigned long long>(saved.shaderFlags), alphaType.data(),
+                saved.alphaFlags, saved.alphaRef, saved.shader ? "; now writes depth" : "; left as is");
+            logNote(message);
+            if (saved.shader || saved.alpha) {
+                ++g_state.hudCount;
+            }
+        }
+    }
+
+    void restoreText() noexcept
+    {
+        __try {
+            for (int i = 0; i < g_state.hudCount; ++i) {
+                auto& saved = g_state.hud[i];
+                if (saved.shader) {
+                    *reinterpret_cast<std::uint64_t*>(saved.shader + 0x30) = saved.shaderFlags;
+                }
+                if (saved.alpha) {
+                    *reinterpret_cast<std::uint16_t*>(saved.alpha + 0x28) = saved.alphaFlags;
+                    *reinterpret_cast<std::int8_t*>(saved.alpha + 0x2A) = saved.alphaRef;
+                }
+                saved = {};
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        g_state.hudCount = 0;
+    }
+
     void afterAdvance() noexcept
     {
         if (!g_settings.enabled || *reinterpret_cast<const bool*>(base() + kVrLoadingMenuSetting) == false) {
@@ -645,6 +734,9 @@ namespace
             g_state.target = computeTarget(*parent, *model, text);
             host->AttachChild(backdrop, true);
             packChildren(*host, backdrop);
+            if (ordered) {
+                protectText(*ordered);
+            }
             dumpScene(*parent);
             setCulled(backdrop, false);
             g_state.parent = host;
