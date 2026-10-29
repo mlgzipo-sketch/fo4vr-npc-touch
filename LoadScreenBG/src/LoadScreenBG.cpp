@@ -63,7 +63,8 @@ namespace
         bool showOverlay{ false };
         int rotationMode{ 0 };
         bool drawFirst{ true };
-        float aimBlend{ 0.7f };
+        bool behindText{ true };
+        float aimBlend{ 0.5f };
         bool dumpScene{ true };
         bool debugLog{ true };
     } g_settings;
@@ -154,6 +155,8 @@ namespace
                     g_settings.aimBlend = number;
                 } else if (key == "bDumpScene") {
                     g_settings.dumpScene = number != 0.0f;
+                } else if (key == "bBehindText") {
+                    g_settings.behindText = number != 0.0f;
                 } else if (key == "bDrawFirst") {
                     g_settings.drawFirst = number != 0.0f;
                 } else if (key == "iRotationMode") {
@@ -171,9 +174,9 @@ namespace
             g_settings.widthDegrees = 110.0f;
         }
         char message[320]{};
-        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f overlay=%d rotationMode=%d",
+        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f aim=%.2f behindText=%d overlay=%d rotationMode=%d",
             g_settings.enabled, g_settings.model.c_str(), g_settings.distance, g_settings.widthDegrees, g_settings.heightOffset,
-            g_settings.showOverlay, g_settings.rotationMode);
+            g_settings.aimBlend, g_settings.behindText, g_settings.showOverlay, g_settings.rotationMode);
         logNote(message);
     }
 
@@ -331,30 +334,21 @@ namespace
         }
     }
 
-    // World target: level with the eye point, centred on the line to the
-    // model, at fDistance and fWidthDegrees wide.
-    Target computeTarget(const RE::NiNode& parent, const RE::NiAVObject& model) noexcept
+    // World target: level with the eye point, centred between the loading
+    // text and the model (fAimBlend), at fDistance and fWidthDegrees wide.
+    Target computeTarget(const RE::NiNode& parent, const RE::NiAVObject& model, const RE::NiAVObject* text) noexcept
     {
         const Vec eye = toVec(parent.world.translate);
         Vec center = toVec(model.worldBound.center);
         if (model.worldBound.fRadius <= 0.0f) {
             center = toVec(model.world.translate);
         }
+        if (text) {
+            const float blend = std::clamp(g_settings.aimBlend, 0.0f, 1.0f);
+            center = add(mul(center, 1.0f - blend), mul(toVec(text->world.translate), blend));
+        }
         Vec dir = sub(center, eye);
         dir.z = 0.0f;
-        // Blend from the model towards straight ahead (the parent's forward
-        // axis, its second row) so the picture sits behind text and model
-        // together rather than behind the model alone.
-        {
-            const auto& r = parent.world.rotate.entry;
-            Vec forward{ r[1][0], r[1][1], 0.0f };
-            if (length(dir) > 1.0f && length(forward) > 1e-3f) {
-                const float blend = std::clamp(g_settings.aimBlend, 0.0f, 1.0f);
-                const Vec toModel = mul(dir, 1.0f / length(dir));
-                forward = mul(forward, 1.0f / length(forward));
-                dir = add(mul(toModel, 1.0f - blend), mul(forward, blend));
-            }
-        }
         if (length(dir) < 1.0f) {
             // Model straight above or below: use the parent's forward (Y) axis.
             const auto& r = parent.world.rotate.entry;
@@ -546,6 +540,30 @@ namespace
         }
     }
 
+    // The loading text and tips are drawn on HUD quads under a BSOrderedNode
+    // in one of World's children (named Point002, like the light). The quads
+    // don't write depth and are drawn before the backdrop, so the backdrop
+    // has to go into that ordered node ahead of them to stay behind the text.
+    RE::NiNode* findTextNode(RE::NiNode& parent, RE::NiAVObject* model, RE::NiNode** ordered) noexcept
+    {
+        auto& children = parent.GetRuntimeData().children;
+        for (std::uint16_t i = 0; i < children.capacity(); ++i) {
+            auto* child = children[i].get();
+            if (!child || child == model || child == g_state.backdrop || std::string_view(rttiName(child)).find("Node") == std::string_view::npos) {
+                continue;
+            }
+            auto& inner = static_cast<RE::NiNode*>(child)->GetRuntimeData().children;
+            for (std::uint16_t j = 0; j < inner.capacity(); ++j) {
+                auto* candidate = inner[j].get();
+                if (candidate && std::string_view(rttiName(candidate)).find("BSOrderedNode") != std::string_view::npos) {
+                    *ordered = static_cast<RE::NiNode*>(candidate);
+                    return static_cast<RE::NiNode*>(child);
+                }
+            }
+        }
+        return nullptr;
+    }
+
     // Logs the parent's children and, with bDrawFirst, moves the backdrop to
     // the first slot so it is drawn before the loading text and tips, which
     // don't write depth and would otherwise be painted over.
@@ -594,31 +612,36 @@ namespace
         if (!backdrop) {
             return;
         }
-        if (backdrop->parent != parent) {
+        RE::NiNode* ordered{ nullptr };
+        auto* text = findTextNode(*parent, model, &ordered);
+        auto* host = g_settings.behindText && ordered ? ordered : parent;
+        if (backdrop->parent != host) {
             if (backdrop->parent) {
                 backdrop->parent->DetachChild(backdrop);
             }
-            g_state.target = computeTarget(*parent, *model);
-            parent->AttachChild(backdrop, true);
-            orderChildren(*parent, backdrop);
+            g_state.target = computeTarget(*parent, *model, text);
+            host->AttachChild(backdrop, true);
+            orderChildren(*host, backdrop);
             dumpScene(*parent);
             setCulled(backdrop, false);
-            g_state.parent = parent;
+            g_state.parent = host;
+            g_state.convention = 0;
 
-            char message[512]{};
+            char message[640]{};
             std::snprintf(message, sizeof(message),
-                "Backdrop attached to %s: eye=(%.0f, %.0f, %.0f) model=%s at (%.0f, %.0f, %.0f) r=%.0f; backdrop origin=(%.0f, %.0f, %.0f) forward=(%.2f, %.2f) scale=%.2f",
-                nameOf(parent), parent->world.translate.x, parent->world.translate.y, parent->world.translate.z,
+                "Backdrop attached to %s: eye=(%.0f, %.0f, %.0f) model=%s at (%.0f, %.0f, %.0f) r=%.0f; text %s at (%.0f, %.0f, %.0f); backdrop origin=(%.0f, %.0f, %.0f) forward=(%.2f, %.2f) scale=%.2f",
+                nameOf(host), parent->world.translate.x, parent->world.translate.y, parent->world.translate.z,
                 nameOf(model), model->worldBound.center.x, model->worldBound.center.y, model->worldBound.center.z, model->worldBound.fRadius,
+                text ? nameOf(text) : "not found", text ? text->world.translate.x : 0.0f, text ? text->world.translate.y : 0.0f, text ? text->world.translate.z : 0.0f,
                 g_state.target.translate.x, g_state.target.translate.y, g_state.target.translate.z,
                 g_state.target.axes[1].x, g_state.target.axes[1].y, g_state.target.scale);
             logNote(message);
         }
         if (g_state.convention == 0) {
-            pickConvention(*backdrop, *parent);
+            pickConvention(*backdrop, *host);
             return;
         }
-        applyTarget(*backdrop, *parent, g_state.target, g_state.convention);
+        applyTarget(*backdrop, *host, g_state.target, g_state.convention);
         updateNode(backdrop);
     }
 
