@@ -66,7 +66,7 @@ namespace
         bool behindText{ true };
         float aimBlend{ 0.5f };
         bool dumpScene{ true };
-        int hudDepth{ 2 };
+        int hudDepth{ 1 };
         bool debugLog{ true };
     } g_settings;
 
