@@ -67,7 +67,7 @@ namespace
         float aimBlend{ 0.5f };
         bool dumpScene{ true };
         int hudDepth{ 0 };
-        bool planeLikeText{ true };
+        bool planeLikeText{ false };
         bool debugLog{ true };
     } g_settings;
 
