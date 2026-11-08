@@ -66,7 +66,8 @@ namespace
         bool behindText{ true };
         float aimBlend{ 0.5f };
         bool dumpScene{ true };
-        int hudDepth{ 1 };
+        int hudDepth{ 0 };
+        bool planeLikeText{ true };
         bool debugLog{ true };
     } g_settings;
 
@@ -156,6 +157,8 @@ namespace
                     g_settings.aimBlend = number;
                 } else if (key == "bDumpScene") {
                     g_settings.dumpScene = number != 0.0f;
+                } else if (key == "bPlaneLikeText") {
+                    g_settings.planeLikeText = number != 0.0f;
                 } else if (key == "iHudDepth") {
                     g_settings.hudDepth = static_cast<int>(number);
                 } else if (key == "bBehindText") {
@@ -177,9 +180,9 @@ namespace
             g_settings.widthDegrees = 110.0f;
         }
         char message[320]{};
-        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f aim=%.2f behindText=%d drawFirst=%d hudDepth=%d overlay=%d rotationMode=%d",
+        std::snprintf(message, sizeof(message), "Settings: enabled=%d model=%s distance=%.0f width=%.0f deg height=%.0f aim=%.2f behindText=%d drawFirst=%d hudDepth=%d planeLikeText=%d overlay=%d rotationMode=%d",
             g_settings.enabled, g_settings.model.c_str(), g_settings.distance, g_settings.widthDegrees, g_settings.heightOffset,
-            g_settings.aimBlend, g_settings.behindText, g_settings.drawFirst, g_settings.hudDepth, g_settings.showOverlay, g_settings.rotationMode);
+            g_settings.aimBlend, g_settings.behindText, g_settings.drawFirst, g_settings.hudDepth, g_settings.planeLikeText, g_settings.showOverlay, g_settings.rotationMode);
         logNote(message);
     }
 
@@ -716,6 +719,71 @@ namespace
         }
     }
 
+    // Shader and alpha property of a geometry, found by type (VR keeps them
+    // at +0x170/+0x178 of BSGeometry, not where the flat game does).
+    std::uint8_t* propertyOf(RE::NiAVObject* geometry, const std::string_view kind) noexcept
+    {
+        auto* bytes = reinterpret_cast<std::uint8_t*>(geometry);
+        for (int offset = 0x120; offset < 0x1C0; offset += 8) {
+            auto* field = *reinterpret_cast<std::uint8_t**>(bytes + offset);
+            if (reinterpret_cast<std::uintptr_t>(field) < 0x10000) {
+                continue;
+            }
+            const std::string_view type = rttiName(field);
+            if (type.starts_with(".?AV") && type.find(kind) != std::string_view::npos) {
+                return field;
+            }
+        }
+        return nullptr;
+    }
+
+    // The text quads are drawn in their own batch before the backdrop, so no
+    // order or depth setting puts the backdrop under them. With
+    // bPlaneLikeText the backdrop's shader and alpha flags are copied from the
+    // text's glass quad, so both land in the same batch, where the ordered
+    // node's order (backdrop first) holds.
+    void matchPlaneToText(RE::NiNode& ordered) noexcept
+    {
+        if (!g_settings.planeLikeText || !g_state.plane) {
+            return;
+        }
+        RE::NiAVObject* glass{ nullptr };
+        auto& children = ordered.GetRuntimeData().children;
+        for (std::uint16_t i = 0; i < children.capacity(); ++i) {
+            auto* child = children[i].get();
+            if (child && std::string_view(nameOf(child)).starts_with("HUDGlassFlat")) {
+                glass = child;
+            }
+        }
+        if (!glass) {
+            logNote("  text glass quad not found; backdrop flags left as they are");
+            return;
+        }
+        auto* textShader = propertyOf(glass, "ShaderProperty");
+        auto* textAlpha = propertyOf(glass, "NiAlphaProperty");
+        auto* planeShader = propertyOf(g_state.plane, "ShaderProperty");
+        auto* planeAlpha = propertyOf(g_state.plane, "NiAlphaProperty");
+        char message[400]{};
+        if (textShader && planeShader) {
+            auto& planeFlags = *reinterpret_cast<std::uint64_t*>(planeShader + 0x30);
+            const auto before = planeFlags;
+            planeFlags = *reinterpret_cast<std::uint64_t*>(textShader + 0x30);
+            std::snprintf(message, sizeof(message), "  backdrop shader flags %016llX -> %016llX (from the text)",
+                static_cast<unsigned long long>(before), static_cast<unsigned long long>(planeFlags));
+            logNote(message);
+        } else {
+            std::snprintf(message, sizeof(message), "  shader property missing (text %d, backdrop %d)", textShader != nullptr, planeShader != nullptr);
+            logNote(message);
+        }
+        if (textAlpha && planeAlpha) {
+            auto& planeFlags = *reinterpret_cast<std::uint16_t*>(planeAlpha + 0x28);
+            const auto before = planeFlags;
+            planeFlags = *reinterpret_cast<std::uint16_t*>(textAlpha + 0x28);
+            std::snprintf(message, sizeof(message), "  backdrop alpha flags %04X -> %04X", before, planeFlags);
+            logNote(message);
+        }
+    }
+
     void restoreText() noexcept
     {
         __try {
@@ -767,6 +835,7 @@ namespace
             packChildren(*host, backdrop);
             if (ordered) {
                 protectText(*ordered);
+                matchPlaneToText(*ordered);
             }
             dumpScene(*parent);
             setCulled(backdrop, false);
