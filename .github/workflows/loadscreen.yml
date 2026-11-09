@@ -1,0 +1,60 @@
+name: loadscreen-bg
+
+on:
+  push:
+    paths:
+      - 'LoadScreenBG/**'
+      - '.github/workflows/loadscreen.yml'
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup cmake
+        uses: lukka/get-cmake@latest
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:VCPKG_ROOT"
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-${{ hashFiles('LoadScreenBG/vcpkg.json') }}
+          restore-keys: vcpkg-
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S LoadScreenBG -B build-lsbg -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build-lsbg --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $plugins = "package\F4SE\Plugins"
+          New-Item -ItemType Directory -Force $plugins | Out-Null
+          Copy-Item build-lsbg\Release\LoadScreenBG.dll $plugins
+          Copy-Item LoadScreenBG\LoadScreenBG.ini $plugins
+
+      - name: Upload mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoadScreenBG
+          path: package
