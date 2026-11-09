@@ -65,10 +65,10 @@ namespace
         bool drawFirst{ true };
         bool behindText{ true };
         float aimBlend{ 0.5f };
-        bool dumpScene{ true };
+        bool dumpScene{ false };
         int hudDepth{ 0 };
         bool planeLikeText{ false };
-        bool debugLog{ true };
+        bool debugLog{ false };
     } g_settings;
 
     std::shared_ptr<spdlog::logger> g_logger;
