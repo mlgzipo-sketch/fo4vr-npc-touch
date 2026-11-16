@@ -5,8 +5,9 @@
 // proxies, whatever their layer or flags. ROCK 0.93 solves this the same way:
 // passive copies of the animated limbs. This file gives each nearby NPC a set
 // of keyframed capsules (torso, shoulders, head, arms, legs) between pairs of
-// bones, on layer 33 (which ROCK's dynamic hands collide with when
-// npcDynamicCollisions = true) and in the NPC's own collision group, so the NPC
+// bones, on layer 33 (ROCK 1.0's dynamic hands collide with it once NpcTouch
+// admits it through NativeInteraction::setDynamicObstacleLayers) and in the
+// NPC's own collision group, so the NPC
 // does not push against them. Every frame each capsule is driven to its bones.
 //
 // Body creation follows ROCK's BethesdaPhysicsBody::create (GPL-3.0,
@@ -778,6 +779,11 @@ namespace npctouch::proxies
             g_legs ? 1 : 0,
             g_maxNpcs);
         runtime::logNote(message);
+    }
+
+    bool enabled() noexcept
+    {
+        return g_enabled;
     }
 
     void update(const bool worldAvailable) noexcept

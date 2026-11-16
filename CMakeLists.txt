@@ -10,13 +10,13 @@ set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE 
 set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
 
-project(NpcTouch VERSION 0.1.0 LANGUAGES CXX)
+project(NpcTouch VERSION 0.2.0 LANGUAGES CXX)
 
 if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
   message(FATAL_ERROR "In-source builds are not allowed")
 endif()
 
-set(RPS_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/extern/RPS_SDK" CACHE PATH "RPS SDK checkout")
+set(ROCK_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/ROCK/include" CACHE PATH "ROCK 1.0 include directory")
 set(COMMON_LIB_F4VR_PATH "${CMAKE_CURRENT_SOURCE_DIR}/extern/CommonLibF4VR" CACHE PATH "CommonLibF4VR checkout")
 
 set(F4SE_SUPPORT_XBYAK ON CACHE BOOL "" FORCE)
@@ -54,11 +54,11 @@ target_compile_definitions(NpcTouch PRIVATE
   WIN32_LEAN_AND_MEAN
   NOMINMAX
   NOMMNOSOUND
-  NPCTOUCH_VERSION=1
+  NPCTOUCH_VERSION=2
   NPCTOUCH_BUILD="${NPCTOUCH_BUILD}"
 )
 target_include_directories(NpcTouch PRIVATE
-  "${RPS_SDK_ROOT}/SDK/ROCK/include"
+  "${ROCK_INCLUDE_DIR}"
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_link_libraries(NpcTouch PRIVATE

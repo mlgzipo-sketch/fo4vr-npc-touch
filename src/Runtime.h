@@ -1,4 +1,4 @@
-// Based on the RPS SDK example runtime (github.com/brunocatani/RPS_SDK).
+// Originally based on the RPS SDK example runtime; uses the ROCK 1.0 API (github.com/brunocatani/ROCK).
 #pragma once
 
 #include <ROCK/Client.h>
@@ -20,7 +20,7 @@ namespace npctouch::runtime
         void (*onStop)(std::uint64_t ownerToken) noexcept{ nullptr };
         void (*onFrame)(
             std::uint64_t ownerToken,
-            const rock::api::core::SnapshotV1& snapshot) noexcept{ nullptr };
+            const rock::api::core::Snapshot& snapshot) noexcept{ nullptr };
     };
 
     [[nodiscard]] const Definition& definition() noexcept;

@@ -8,4 +8,7 @@ namespace npctouch::proxies
     // Called every frame: keeps an invisible physics body on the chest of each
     // NPC near the player, so ROCK's hands stop against it.
     void update(bool worldAvailable) noexcept;
+
+    // bHandsCollideWithNPCs from NpcTouch.ini.
+    [[nodiscard]] bool enabled() noexcept;
 }

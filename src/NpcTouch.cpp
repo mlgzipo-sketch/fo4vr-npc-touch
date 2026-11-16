@@ -6,9 +6,9 @@
 // to the log and to a short in-headset debug overlay.
 
 #include <ROCK/Collision.h>
-#include <ROCK/Diagnostics.h>
 #include <ROCK/Hands.h>
 #include <ROCK/Input.h>
+#include <ROCK/NativeInteraction.h>
 #include "HandGrip.h"
 #include "NpcCollision.h"
 #include "NpcProxyBodies.h"
@@ -33,19 +33,19 @@ namespace
     using Clock = std::chrono::steady_clock;
     using npctouch::runtime::hasLifecycleFlag;
     namespace collision = rock::api::collision;
-    namespace diagnostics = rock::api::diagnostics;
     namespace hands = rock::api::hands;
     namespace input = rock::api::input;
+    namespace native = rock::api::native_interaction;
 
     constexpr auto kOverlayDuration = std::chrono::seconds(3);
     constexpr auto kSummaryInterval = std::chrono::seconds(10);
 
-    const collision::ApiV1* g_collision{};
-    const diagnostics::ApiV1* g_diagnostics{};
-    const hands::ApiV1* g_hands{};
-    const input::ApiV1* g_input{};
+    const collision::Api* g_collision{};
+    const hands::Api* g_hands{};
+    const input::Api* g_input{};
+    const native::Api* g_native{};
+    std::uint64_t g_ownerToken{ 0 };
 
-    std::uint64_t g_lastEventSequence{ 0 };
     std::uint64_t g_npcTouchCount{ 0 };
     std::uint64_t g_otherTouchCount{ 0 };
     std::uint64_t g_contactBeginCount{ 0 };
@@ -53,7 +53,6 @@ namespace
     // Last status of each ROCK read, reported in the summary for diagnosis.
     struct Diagnostics
     {
-        std::uint32_t eventsStatus{ 0xFFFFFFFF };
         std::uint32_t contactsStatus{ 0xFFFFFFFF };
         std::uint32_t contactsSeen{ 0 };
         struct Hand
@@ -71,7 +70,6 @@ namespace
         float bonePosition[3]{};
         bool usedCapsule{ false };
     } g_diag{};
-    std::uint64_t g_lostEventCount{ 0 };
     Clock::time_point g_lastSummary{};
 
     char g_overlayText[128]{};
@@ -156,101 +154,12 @@ namespace
         }
     }
 
-    void handleTouchEvent(const collision::EventV1& event) noexcept
-    {
-        const bool begin = event.kind == static_cast<std::uint32_t>(collision::EventKindV1::Touch);
-        auto* npc = resolveNpc(event.formId);
-        if (!npc) {
-            if (begin) {
-                ++g_otherTouchCount;
-            }
-            if (allowDiagnosticLine()) {
-                char described[192]{};
-                describeForm(event.formId, described, sizeof(described));
-                char message[288]{};
-                std::snprintf(
-                    message,
-                    sizeof(message),
-                    "%s (not NPC): %s hand -> %s layer=%u",
-                    begin ? "touch begin" : "touch end",
-                    handName(event.hand),
-                    described,
-                    event.collisionLayer);
-                npctouch::runtime::logInfo(message);
-                if (begin) {
-                    char overlay[128]{};
-                    std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> object layer %u", handName(event.hand), event.collisionLayer);
-                    showOverlay(overlay);
-                }
-            }
-            return;
-        }
-
-        char message[256]{};
-        std::snprintf(
-            message,
-            sizeof(message),
-            "%s: %s hand -> NPC '%s' form=%08X layer=%u frame=%llu",
-            begin ? "TOUCH BEGIN" : "TOUCH END",
-            handName(event.hand),
-            actorName(npc),
-            event.formId,
-            event.collisionLayer,
-            static_cast<unsigned long long>(event.frameIndex));
-        npctouch::runtime::logInfo(message);
-
-        if (begin) {
-            ++g_npcTouchCount;
-            char overlay[128]{};
-            std::snprintf(overlay, sizeof(overlay), "NpcTouch: %s hand -> %s", handName(event.hand), actorName(npc));
-            showOverlay(overlay);
-        }
-    }
-
-    void pollTouchEvents(const std::uint64_t ownerToken) noexcept
-    {
-        // Drain a bounded number of batches so a burst cannot stall the frame.
-        for (int batch = 0; batch < 4; ++batch) {
-            std::array<collision::EventV1, 32> events{};
-            rock::api::StreamV1 stream{};
-            const auto status = g_collision->copyEvents(
-                ownerToken,
-                g_lastEventSequence,
-                events.data(),
-                static_cast<std::uint32_t>(events.size()),
-                &stream);
-            g_diag.eventsStatus = static_cast<std::uint32_t>(status);
-            if (status != rock::api::Status::Ok) {
-                return;
-            }
-            if (stream.lostCount > g_lostEventCount) {
-                char message[128]{};
-                std::snprintf(
-                    message,
-                    sizeof(message),
-                    "ROCK dropped %llu collision events before they were read",
-                    static_cast<unsigned long long>(stream.lostCount - g_lostEventCount));
-                npctouch::runtime::logWarning(message);
-                g_lostEventCount = stream.lostCount;
-            }
-            for (std::uint32_t index = 0; index < stream.copiedCount; ++index) {
-                handleTouchEvent(events[index]);
-            }
-            if (stream.copiedCount != 0) {
-                g_lastEventSequence = stream.nextSequence;
-            }
-            if (stream.remainingCount == 0) {
-                return;
-            }
-        }
-    }
-
     // Finger-level detail: which part of the hand started touching which NPC.
     void pollFingerContacts(const std::uint64_t ownerToken, const rock::api::Hand hand) noexcept
     {
-        std::array<collision::SemanticHandContactV1, 20> contacts{};
+        std::array<collision::SemanticHandContact, 20> contacts{};
         std::uint32_t contactCount{ 0 };
-        const auto status = g_collision->copySemanticHandContactsV1(
+        const auto status = g_collision->copySemanticHandContacts(
             ownerToken,
             hand,
             0,
@@ -265,7 +174,7 @@ namespace
 
         for (std::uint32_t index = 0; index < contactCount && index < contacts.size(); ++index) {
             const auto& contact = contacts[index];
-            if (contact.contactState != collision::SemanticContactStateV1::Begin) {
+            if (contact.contactState != collision::SemanticContactState::Begin) {
                 continue;
             }
             ++g_contactBeginCount;
@@ -461,11 +370,11 @@ namespace
 
         bool readHand(const std::uint64_t ownerToken, const rock::api::Hand hand, HandState& state) noexcept
         {
-            hands::HandFrameV1 frame{};
+            hands::HandFrame frame{};
             if (!g_hands) {
                 return false;
             }
-            const auto status = g_hands->getHandFrameV1(ownerToken, hand, &frame);
+            const auto status = g_hands->getHandFrame(ownerToken, hand, &frame);
             auto& diag = g_diag.hand[hand == rock::api::Hand::Right ? 0 : 1];
             diag.status = static_cast<std::uint32_t>(status);
             diag.flags = frame.flags;
@@ -475,7 +384,7 @@ namespace
             if (status != rock::api::Status::Ok) {
                 return false;
             }
-            if ((frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) == 0) {
+            if ((frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlag::Valid)) == 0) {
                 return false;
             }
             const auto now = Clock::now();
@@ -609,8 +518,8 @@ namespace
             if (!g_input) {
                 return false;
             }
-            input::RawWandButtonStateV1 button{};
-            const auto status = g_input->getRawWandButtonStateV1(ownerToken, hand, kGripButton, &button);
+            input::RawWandButtonState button{};
+            const auto status = g_input->getRawWandButtonState(ownerToken, hand, kGripButton, &button);
             if (state.gripStatusLogged < 2 && (status != rock::api::Status::Ok || button.held)) {
                 ++state.gripStatusLogged;
                 char message[160]{};
@@ -2246,9 +2155,9 @@ namespace
             const RE::NiPoint3 authority = offsetOf(state.position);
             float presentedLength = -1.0f;
             RE::NiPoint3 presented{};
-            hands::HandFrameV1 frame{};
-            if (g_hands->getPresentedHandFrameV1 && g_hands->getPresentedHandFrameV1(ownerToken, hand, &frame) == rock::api::Status::Ok &&
-                (frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlagV1::Valid)) != 0) {
+            hands::HandFrame frame{};
+            if (g_hands->getPresentedHandFrame && g_hands->getPresentedHandFrame(ownerToken, hand, &frame) == rock::api::Status::Ok &&
+                (frame.flags & static_cast<std::uint32_t>(hands::HandFrameFlag::Valid)) != 0) {
                 presented = offsetOf(RE::NiPoint3{ frame.transform.translate[0], frame.transform.translate[1], frame.transform.translate[2] });
                 presentedLength = std::sqrt(presented.x * presented.x + presented.y * presented.y + presented.z * presented.z);
             }
@@ -2370,8 +2279,7 @@ namespace
         std::snprintf(
             detail,
             sizeof(detail),
-            "  status: events=%u contacts=%u (seen %u) hands=%s nearbyNPCs=%u",
-            g_diag.eventsStatus,
+            "  status: contacts=%u (seen %u) hands=%s nearbyNPCs=%u",
             g_diag.contactsStatus,
             g_diag.contactsSeen,
             g_hands ? "yes" : "no",
@@ -2414,62 +2322,85 @@ namespace
         g_contactBeginCount = 0;
     }
 
-    void publishOverlay(
-        const std::uint64_t ownerToken,
-        const rock::api::core::SnapshotV1& snapshot) noexcept
+    // ROCK 1.0 moved NPC collision out of ROCK: its dynamic hands only stop
+    // against actor layers an extension admits. The NPC proxy capsules live on
+    // layer 33 (BipedNoCC), so admit it while bHandsCollideWithNPCs is on.
+    // Update runs once per ROCK physics frame; the call is cheap but is only
+    // repeated when the wanted mask changes or the world was retired.
+    std::uint64_t g_obstacleMask{ ~0ull };
+
+    void ROCK_CALL onNativeUpdate(const native::Frame*, void*) noexcept
     {
-        if (!g_diagnostics || Clock::now() >= g_overlayUntil ||
-            !hasLifecycleFlag(snapshot.lifecycleFlags, rock::api::core::LifecycleFlag::VisualWriteAllowed)) {
+        if (!g_native || g_ownerToken == 0) {
             return;
         }
-        diagnostics::DebugOverlayTextV1 text{};
-        std::snprintf(text.text, sizeof(text.text), "%s", g_overlayText);
-        text.x = 18.0f;
-        text.y = 18.0f;
-        text.textSize = 1.8f;
+        const std::uint64_t wanted = npctouch::proxies::enabled() ? (1ull << 33) : 0ull;
+        if (wanted == g_obstacleMask) {
+            return;
+        }
+        if (g_native->setDynamicObstacleLayers(g_ownerToken, wanted) == rock::api::Status::Ok) {
+            g_obstacleMask = wanted;
+        }
+    }
 
-        diagnostics::DebugOverlayPublicationV1 publication{};
-        publication.textCount = 1;
-        publication.textEntries = &text;
-        publication.worldGeneration = snapshot.worldGeneration;
-        publication.skeletonGeneration = snapshot.skeletonGeneration;
-        publication.providerGeneration = snapshot.providerGeneration;
-        publication.leaseFrames = 2;
-        (void)g_diagnostics->publishDebugOverlayV1(ownerToken, &publication);
+    void ROCK_CALL onNativeRetire(const native::Frame*, void*) noexcept
+    {
+        g_obstacleMask = ~0ull;
+    }
+
+    void registerNativeExtension(rock::api::Client& client) noexcept
+    {
+        constexpr std::uint32_t readWrite = 3;
+        if (client.acquire(readWrite, g_native) != rock::api::Status::Ok || !g_native) {
+            g_native = nullptr;
+            npctouch::runtime::logWarning("ROCK native interaction unavailable; hands will pass through NPCs");
+            return;
+        }
+        native::Callbacks callbacks{};
+        callbacks.update = &onNativeUpdate;
+        callbacks.retire = &onNativeRetire;
+        g_ownerToken = client.owner();
+        g_obstacleMask = ~0ull;
+        const auto status = g_native->registerExtension(client.owner(), &callbacks);
+        if (status != rock::api::Status::Ok) {
+            g_native = nullptr;
+            char message[128]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "ROCK refused the NPC collision extension (status %u); hands will pass through NPCs",
+                static_cast<std::uint32_t>(status));
+            npctouch::runtime::logWarning(message);
+            return;
+        }
+        npctouch::runtime::logNote("ROCK hands collide with NPC capsules (layer 33 admitted)");
     }
 
     bool connect(rock::api::Client& client, rock::api::QueryInterfaceV1) noexcept
     {
-        constexpr auto read = static_cast<std::uint32_t>(collision::PermissionV1::Read);
+        constexpr auto read = static_cast<std::uint32_t>(collision::Permission::Read);
         if (client.acquire(read, g_collision) != rock::api::Status::Ok) {
+            npctouch::runtime::logWarning("ROCK collision interface unavailable");
             return false;
         }
-        // The overlay is a convenience; touches are still logged without it.
-        constexpr auto readWrite = static_cast<std::uint32_t>(diagnostics::PermissionV1::Read) |
-                                   static_cast<std::uint32_t>(diagnostics::PermissionV1::Write);
-        if (client.acquire(readWrite, g_diagnostics) != rock::api::Status::Ok) {
-            g_diagnostics = nullptr;
-            npctouch::runtime::logWarning("ROCK diagnostics overlay unavailable; logging only");
-        }
         // Hands feeds the proximity fallback; without it only ROCK contacts are used.
-        if (client.acquire(static_cast<std::uint32_t>(hands::PermissionV1::Read), g_hands) != rock::api::Status::Ok) {
+        if (client.acquire(static_cast<std::uint32_t>(hands::Permission::Read), g_hands) != rock::api::Status::Ok) {
             g_hands = nullptr;
             npctouch::runtime::logWarning("ROCK hands interface unavailable; proximity touch detection disabled");
         }
         // Input gives the grip button for grabbing NPCs.
-        if (client.acquire(static_cast<std::uint32_t>(input::PermissionV1::Read), g_input) != rock::api::Status::Ok) {
+        if (client.acquire(static_cast<std::uint32_t>(input::Permission::Read), g_input) != rock::api::Status::Ok) {
             g_input = nullptr;
             npctouch::runtime::logWarning("ROCK input interface unavailable; grabbing NPCs disabled");
         } else {
             npctouch::runtime::logNote("ROCK input interface ready; grip + touch grabs NPCs");
         }
+        registerNativeExtension(client);
         return true;
     }
 
     bool start(const std::uint64_t) noexcept
     {
-        g_lastEventSequence = 0;
-        g_lostEventCount = 0;
         g_otherTouchCount = 0;
         g_lastSummary = Clock::now();
         g_overlayUntil = {};
@@ -2486,20 +2417,14 @@ namespace
         return true;
     }
 
-    void stop(const std::uint64_t ownerToken) noexcept
+    void stop(const std::uint64_t) noexcept
     {
-        if (g_diagnostics) {
-            (void)g_diagnostics->clearDebugOverlayV1(ownerToken);
-        }
-        g_lastEventSequence = 0;
-        g_lostEventCount = 0;
     }
 
     void frame(
         const std::uint64_t ownerToken,
-        const rock::api::core::SnapshotV1& snapshot) noexcept
+        const rock::api::core::Snapshot& snapshot) noexcept
     {
-        pollTouchEvents(ownerToken);
         pollFingerContacts(ownerToken, rock::api::Hand::Right);
         pollFingerContacts(ownerToken, rock::api::Hand::Left);
         proximity::update(ownerToken);
@@ -2510,7 +2435,6 @@ namespace
         npctouch::collision::update(worldAvailable);
         npctouch::proxies::update(worldAvailable);
         logSummary();
-        publishOverlay(ownerToken, snapshot);
     }
 }
 

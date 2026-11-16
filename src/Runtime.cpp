@@ -1,4 +1,4 @@
-// Based on the RPS SDK example runtime (github.com/brunocatani/RPS_SDK).
+// Originally based on the RPS SDK example runtime; uses the ROCK 1.0 API (github.com/brunocatani/ROCK).
 #include "Runtime.h"
 
 #include <F4SE/F4SE.h>
@@ -21,7 +21,7 @@ namespace
     using npctouch::runtime::hasLifecycleFlag;
 
     rock::api::Client g_client;
-    const rock::api::core::ApiV1* g_core{};
+    const rock::api::core::Api* g_core{};
     std::shared_ptr<spdlog::logger> g_logger;
     std::uint64_t g_ownerToken{ 0 };
     std::uint64_t g_callbackToken{ 0 };
@@ -91,7 +91,7 @@ namespace
     }
 
     void ROCK_CALL onRockFrame(
-        const rock::api::core::SnapshotV1* snapshot,
+        const rock::api::core::Snapshot* snapshot,
         void*)
     {
         if (!snapshot || g_ownerToken == 0) {
@@ -118,7 +118,24 @@ namespace
         const auto& example = npctouch::runtime::definition();
         const auto module=GetModuleHandleA("ROCK.dll");
         const auto query=module?reinterpret_cast<rock::api::QueryInterfaceV1>(GetProcAddress(module,rock::api::kQueryExportName)):nullptr;
-        if(g_client.connect(query,example.pluginName)!=rock::api::Status::Ok)return false;
+        if (!query) {
+            return false;
+        }
+        const auto connectStatus = g_client.connect(query, example.pluginName);
+        if (connectStatus != rock::api::Status::Ok) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                char message[160]{};
+                std::snprintf(
+                    message,
+                    sizeof(message),
+                    "ROCK refused the connection (status %u); NpcTouch needs ROCK 1.0 or newer",
+                    static_cast<std::uint32_t>(connectStatus));
+                npctouch::runtime::logWarning(message);
+            }
+            return false;
+        }
         if(g_client.acquire(5,g_core)!=rock::api::Status::Ok ||
            (example.onConnect && !example.onConnect(g_client,query))) {
             (void)g_client.close();
@@ -131,7 +148,7 @@ namespace
         }
 
         const auto callbackResult =
-            g_core->registerFrameCallbackForOwnerV1(
+            g_core->registerFrameCallback(
                 g_ownerToken,
                 &onRockFrame,
                 nullptr,

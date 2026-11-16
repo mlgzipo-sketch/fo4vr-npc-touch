@@ -18,7 +18,7 @@ Physical interaction with NPCs in Fallout 4 VR, inspired by PLANCK for Skyrim VR
 - [F4SE VR](https://f4se.silverlock.org/)
 - VR Address Library for F4SEVR
 - [FRIK](https://www.nexusmods.com/fallout4/mods/53464) 0.79.1 or newer (needs FRIK API v2.3+)
-- [ROCK](https://github.com/brunocatani/ROCK) 0.9 or newer, with `npcDynamicCollisions = true` in `ROCK.ini` (the default)
+- [ROCK](https://github.com/brunocatani/ROCK) 1.0 or newer (NpcTouch 0.2 and later). NpcTouch 0.1 works only with ROCK 0.92 and earlier.
 
 ## Installation
 
@@ -62,6 +62,7 @@ You need Visual Studio 2022, CMake and vcpkg (`VCPKG_ROOT`).
 
 ```powershell
 git clone --recursive https://github.com/mlgzipo-sketch/fo4vr-npc-touch
+cd fo4vr-npc-touch
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
@@ -69,7 +70,7 @@ cmake --build build --config Release
 ## Credits
 
 - **FlyingParticle (adamhynek)**: the idea. [PLANCK](https://www.nexusmods.com/skyrimspecialedition/mods/66025) for Skyrim VR showed how physical NPC interaction in VR should feel. This mod is my attempt at bringing that to Fallout 4 VR.
-- **brunocatani**: [ROCK](https://github.com/brunocatani/ROCK) and the [RPS SDK](https://github.com/brunocatani/RPS_SDK). ROCK provides the physical hands. The NPC collision bodies are adapted from ROCK's physics body code, and the plugin runtime is based on the RPS SDK examples.
+- **brunocatani**: [ROCK](https://github.com/brunocatani/ROCK) and the [RPS SDK](https://github.com/brunocatani/RPS_SDK). ROCK provides the physical hands. The NPC collision bodies are adapted from ROCK's physics body code, the plugin runtime was based on the RPS SDK examples, and `extern/ROCK` holds ROCK's API headers.
 - **FRIK authors**: [FRIK](https://www.nexusmods.com/fallout4/mods/53464) and its API for finger poses and hand placement.
 - **CommonLibF4 / CommonLibF4VR contributors** and the **F4SE team**.
 
